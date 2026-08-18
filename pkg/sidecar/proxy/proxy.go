@@ -172,6 +172,9 @@ type Config struct {
 	ECConnector string
 	// DataParallelSize is the value passed to the vLLM server's --DATA_PARALLEL-SIZE argument.
 	DataParallelSize int
+	// DataParallelMode controls whether each DP rank has a distinct local model
+	// server port or all rank listeners pin requests to one internal-LB server.
+	DataParallelMode string
 
 	// MaxIdleConnsPerHost controls how many idle keep-alive connections are
 	// maintained per host for the reverse proxy transports. Set this to at
@@ -358,6 +361,7 @@ type Server struct {
 	mooncakeEngineIDs   *lru.Cache[string, map[string]string] // cached mooncake dp_rank->engine_id per prefill host:port
 	dataParallelProxies map[string]http.Handler               // Proxies to other vLLM servers
 	forwardDataParallel bool                                  // Use special Data Parallel work around
+	dataParallelRank    int                                   // Rank represented by this listener in internal-lb mode
 
 	prefillSamplerFn func(n int) int // allow test override
 
@@ -527,6 +531,7 @@ func (s *Server) Clone() *Server {
 		mooncakeEngineIDs:   s.mooncakeEngineIDs,
 		dataParallelProxies: s.dataParallelProxies,
 		forwardDataParallel: s.forwardDataParallel,
+		dataParallelRank:    s.dataParallelRank,
 		prefillSamplerFn:    s.prefillSamplerFn,
 		dpBasePort:          s.dpBasePort,
 		config:              s.config,
@@ -631,6 +636,9 @@ func (s *Server) createRoutes() *http.ServeMux {
 	mux.HandleFunc("POST "+GeneratePath, s.disaggregatedPrefillHandler(APITypeGenerate))
 
 	s.decoderProxy = s.createDecoderProxyHandler(s.config.DecoderURL, s.config.InsecureSkipVerifyForDecoder)
+	if s.config.DataParallelMode == DataParallelModeInternalLB {
+		s.decoderProxy = newInternalLBProxyHandler(s.decoderProxy, s.dataParallelRank)
+	}
 
 	mux.Handle("/", s.decoderProxy)
 
