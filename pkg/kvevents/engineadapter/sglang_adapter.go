@@ -107,7 +107,7 @@ type msgpackSGLangBlockStoredEvent struct {
 	Tag             string
 	BlockHashes     []any
 	ParentBlockHash any
-	TokenIds        []uint32
+	TokenIds        any
 	BlockSize       int
 	LoraID          *int    `msgpack:",omitempty"`
 	Medium          *string `msgpack:",omitempty"`
@@ -136,6 +136,32 @@ func padFields(rawEventBytes []byte, fields []any, expectedCount int) ([]byte, e
 		return nil, fmt.Errorf("failed to re-marshal padded event: %w", err)
 	}
 	return paddedBytes, nil
+}
+
+// convertSGLangTokenIDs accepts both the ordinary flat token list and the DSA
+// radix-cache bigram form [[t0,t1], [t1,t2], ...]. Taking each pair's first
+// token reconstructs the logical page consumed by the request-side indexer.
+func convertSGLangTokenIDs(raw any) ([]uint32, error) {
+	values, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("token_ids is not an array: %T", raw)
+	}
+	tokens := make([]uint32, len(values))
+	for i, value := range values {
+		if pair, isBigram := value.([]any); isBigram {
+			if len(pair) != 2 {
+				return nil, fmt.Errorf("token_ids[%d] bigram has %d elements, expected 2", i, len(pair))
+			}
+			value = pair[0]
+		}
+		token, err := toInt(value)
+		if err != nil {
+			return nil, fmt.Errorf("token_ids[%d]: %w", i, err)
+		}
+		//nolint:gosec // token IDs fit in uint32
+		tokens[i] = uint32(token)
+	}
+	return tokens, nil
 }
 
 // convertBlockStoredEvent decodes and converts a BlockStored event to a generic event.
@@ -169,6 +195,10 @@ func (s *SGLangAdapter) convertBlockStoredEvent(rawEventBytes []byte) (kvevents.
 	if err != nil {
 		return nil, err
 	}
+	tokens, err := convertSGLangTokenIDs(event.TokenIds)
+	if err != nil {
+		return nil, err
+	}
 
 	var parentHash uint64
 	if event.ParentBlockHash != nil {
@@ -186,7 +216,7 @@ func (s *SGLangAdapter) convertBlockStoredEvent(rawEventBytes []byte) (kvevents.
 
 	return &kvevents.BlockStoredEvent{
 		BlockHashes: blockHashes,
-		Tokens:      event.TokenIds,
+		Tokens:      tokens,
 		ParentHash:  parentHash,
 		BlockSize:   event.BlockSize,
 		DeviceTier:  deviceTier,

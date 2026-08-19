@@ -153,6 +153,36 @@ func TestSGLangBlockStored_7Fields(t *testing.T) {
 	assert.Nil(t, blockStored.ExtraKeys, "SGLang does not send extra_keys")
 }
 
+// TestSGLangBlockStored_BigramTokens verifies the DSA radix-cache wire format,
+// where each logical token is represented by the overlapping pair [t_i, t_i+1].
+func TestSGLangBlockStored_BigramTokens(t *testing.T) {
+	adapter := NewSGLangAdapter()
+
+	event := []any{
+		"BlockStored",
+		[]any{uint64(300)},
+		uint64(299),
+		[]any{
+			[]any{uint64(7), uint64(8)},
+			[]any{uint64(8), uint64(9)},
+			[]any{uint64(9), uint64(10)},
+		},
+		3,
+		nil,
+		"GPU",
+	}
+
+	rawBytes, err := msgpack.Marshal(event)
+	require.NoError(t, err)
+
+	result, err := decodeEvent(rawBytes, adapter.eventConverters)
+	require.NoError(t, err)
+
+	blockStored, ok := result.(*kvevents.BlockStoredEvent)
+	require.True(t, ok)
+	assert.Equal(t, []uint32{7, 8, 9}, blockStored.Tokens)
+}
+
 // TestSGLangBlockStored_MinimalFields tests decoding with only the minimum required fields.
 func TestSGLangBlockStored_MinimalFields(t *testing.T) {
 	adapter := NewSGLangAdapter()
