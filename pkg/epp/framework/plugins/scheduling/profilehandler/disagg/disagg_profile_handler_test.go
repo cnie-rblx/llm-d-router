@@ -220,6 +220,12 @@ func TestHandlerFactory(t *testing.T) {
 			"profiles": map[string]any{"decode": "my-decode", "prefill": "my-prefill"},
 			"deciders": map[string]any{"prefill": PrefixBasedPDDeciderPluginType},
 		}, false},
+		{"PD rank compatibility parameters", map[string]any{
+			"profiles":                    map[string]any{"decode": "my-decode", "prefill": "my-prefill"},
+			"deciders":                    map[string]any{"prefill": AlwaysDisaggPDDeciderPluginType},
+			"primaryPort":                 8000,
+			"prefixMatchInfoProducerName": "precise-prefix-cache-producer",
+		}, false},
 
 		// E/PD style (encode + decode)
 		{"EPD style", map[string]any{
@@ -587,6 +593,37 @@ func TestHandler_ProcessResults_PD(t *testing.T) {
 			tt.check(t, res)
 		})
 	}
+}
+
+func TestHandler_ProcessResults_RewritesDecodePortForRankCompatibility(t *testing.T) {
+	h := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "", nil, nil).
+		WithPrimaryPort(8000)
+	req := &scheduling.InferenceRequest{Headers: map[string]string{}}
+	results := map[string]*scheduling.ProfileRunResult{
+		defaultDecodeProfile: {
+			TargetEndpoints: []scheduling.Endpoint{makeEndpoint(
+				k8stypes.NamespacedName{Namespace: "default", Name: "decode-rank-5"},
+				"10.0.0.1", "8005", nil,
+			)},
+		},
+	}
+
+	res, err := h.ProcessResults(context.Background(), req, results)
+
+	assert.NoError(t, err)
+	assert.Equal(t, "10.0.0.1:8005", req.Headers[routing.DataParallelEndpointHeader])
+	assert.Equal(t, "8000", res.ProfileResults[defaultDecodeProfile].TargetEndpoints[0].GetMetadata().Port)
+}
+
+func TestHandler_ConsumesConfiguredPrefixProducer(t *testing.T) {
+	h := NewDisaggProfileHandler(defaultDecodeProfile, defaultPrefillProfile, "", nil, nil).
+		WithPrefixMatchInfoProducerName("precise-prefix-cache-producer")
+
+	consumed := h.Consumes()
+
+	assert.Contains(t, consumed.Required,
+		attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName("precise-prefix-cache-producer"))
+	assert.NotContains(t, consumed.Required, attrprefix.PrefixCacheMatchInfoDataKey)
 }
 
 func TestHandler_ProcessResults_NilRequest(t *testing.T) {

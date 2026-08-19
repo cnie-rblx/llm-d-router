@@ -146,7 +146,9 @@ func (s *Server) handleSGLangConcurrentRequests(w http.ResponseWriter, r *http.R
 
 	// Send decode request synchronously
 	decodeReq = decodeReq.WithContext(ctx)
-	s.decoderProxy.ServeHTTP(w, decodeReq)
+	if !s.forwardDataParallel || !s.dataParallelHandler(w, decodeReq) {
+		s.decoderProxy.ServeHTTP(w, decodeReq)
+	}
 
 	decodeDuration := time.Since(decodeStart)
 	decodeSpan.SetAttributes(

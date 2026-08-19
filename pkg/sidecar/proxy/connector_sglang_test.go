@@ -177,4 +177,31 @@ var _ = Describe("SGLang Connector", func() {
 		testInfo.cancelFn()
 		<-testInfo.stoppedCh
 	})
+
+	It("should dispatch decode to the data-parallel endpoint selected by EPP", func() {
+		var defaultDecodeRequests atomic.Int32
+		var selectedDecodeRequests atomic.Int32
+		testInfo.proxy.decoderProxy = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			defaultDecodeRequests.Add(1)
+			w.WriteHeader(http.StatusOK)
+		})
+		selectedHostPort := "10.0.0.1:8005"
+		testInfo.proxy.forwardDataParallel = true
+		testInfo.proxy.dataParallelProxies[selectedHostPort] = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			selectedDecodeRequests.Add(1)
+			w.WriteHeader(http.StatusOK)
+		})
+
+		req := httptest.NewRequest(http.MethodPost, ChatCompletionsPath,
+			bytes.NewBufferString(`{"model":"Qwen","messages":[{"role":"user","content":"Hello"}]}`))
+		req.Header.Set(routing.DataParallelEndpointHeader, selectedHostPort)
+		res := httptest.NewRecorder()
+		body := []byte(`{"model":"Qwen","messages":[{"role":"user","content":"Hello"}]}`)
+
+		testInfo.proxy.handleSGLangConcurrentRequests(res, req, body,
+			testInfo.prefillBackend.URL[len("http://"):])
+
+		Expect(selectedDecodeRequests.Load()).To(Equal(int32(1)))
+		Expect(defaultDecodeRequests.Load()).To(Equal(int32(0)))
+	})
 })
