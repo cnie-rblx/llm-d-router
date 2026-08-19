@@ -29,6 +29,10 @@ Backend selection:
   `/v1/chat/completions/render` over plain HTTP (TLS is not supported). Future
   protocol fields (e.g. `grpc`) can be added alongside `url` under the same
   `vllm` block.
+- **`sglang`**: calls SGLang's `/tokenize` endpoint and returns the exact token
+  IDs used by the serving engine. This backend does not require `modelName`.
+  SGLang does not currently return multimodal hashes or placeholder ranges, so
+  precise-cache correlation is limited to text-only requests.
 - **`udsTokenizerConfig`**: deprecated gRPC-over-UDS sidecar (see warning below).
 
 > [!WARNING]
@@ -52,6 +56,9 @@ Backend selection:
 | `vllm.url`       | `http://localhost:8000` | Base URL of the vLLM render endpoint (no trailing slash).         |
 | `vllm.timeout`   | `5s`                    | Per-request timeout for text-only requests.                       |
 | `vllm.mmTimeout` | `30s`                   | Per-request timeout for multimodal requests.                      |
+| `sglang.url`     | `http://localhost:8000` | Base URL of the SGLang server.                                    |
+| `sglang.timeout` | `5s`                    | Per-request timeout for text-only requests.                       |
+| `sglang.mmTimeout` | `30s`                 | Per-request timeout for multimodal requests.                      |
 
 The `estimate` backend tunes multimodal image placeholder estimation (empty uses
 the defaults below):
