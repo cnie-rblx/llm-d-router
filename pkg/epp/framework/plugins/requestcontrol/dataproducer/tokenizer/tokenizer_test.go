@@ -109,6 +109,17 @@ func TestPluginFactory_Validation(t *testing.T) {
 			expectErr: false,
 		},
 		{
+			name:      "sglang backend parses without modelName",
+			params:    `{"sglang":{"url":"http://model-server:8000"}}`,
+			expectErr: false,
+		},
+		{
+			name:       "sglang and vllm are mutually exclusive",
+			params:     `{"modelName":"model","sglang":{},"vllm":{}}`,
+			expectErr:  true,
+			errContain: "only one of",
+		},
+		{
 			name:       "invalid estimate image mode",
 			params:     `{"estimate":{"image":{"mode":"bogus"}}}`,
 			expectErr:  true,
