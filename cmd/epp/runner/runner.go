@@ -68,6 +68,7 @@ import (
 	attrprefix "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/prefix"
 	attrsession "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/session"
 	attrtopology "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/topology"
+	crossplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/cross_plugin"
 	discoveryfile "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/discovery/file"
 	extdcgm "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/extractor/dcgm"
 	extractormetrics "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/extractor/metrics"
@@ -564,6 +565,10 @@ func setupDatastore(ctx context.Context, epFactory datalayer.EndpointFactory,
 
 // registerInTreePlugins registers the factory functions of all known plugins
 func (r *Runner) registerInTreePlugins() {
+	// cross-replica state synchronization
+	// Beta
+	fwkplugin.Register(crossplugin.KubernetesSyncerType, fwkplugin.StabilityBeta, crossplugin.KubernetesSyncerFactory)
+
 	// request control screeners
 	// Alpha
 	fwkplugin.Register(disaggregatedsetrollout.PluginType, fwkplugin.StabilityAlpha, disaggregatedsetrollout.Factory)
