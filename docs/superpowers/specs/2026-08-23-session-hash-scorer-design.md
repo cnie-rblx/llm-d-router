@@ -8,7 +8,7 @@ moving the same deterministic selection from Envoy into the EPP and the
 rank-aware sidecar path, without changing the cache-locality policy.
 
 This is an experiment-focused plugin. It is not a general consistent-hashing
-framework, does not retain session state, and does not change decode routing.
+framework and does not retain session state.
 
 ## Existing Lua Contract
 
@@ -68,9 +68,16 @@ will not combine the hash score with load-aware or precise-prefix-cache scores;
 therefore, a non-empty `session-id` deterministically selects the same rank as
 Lua.
 
-Decode keeps the current load-aware profile. The experiment uses one prefill
-pod exposing eight rank endpoints, so each rank has exactly one candidate and
-there is no cross-pod duplicate-rank tie to define.
+The same scorer also selects the decode rank. This matches 1e, where Envoy's
+`x-data-parallel-rank` header reaches whichever decode pod EPP selects. The
+decode profile gives the session hash weight `2` and active-request scoring
+weight `1`: a matching-rank endpoint therefore always outranks a non-matching
+endpoint, while active load selects between the two decode pods that expose the
+same matching rank.
+
+The experiment uses one prefill pod exposing eight rank endpoints and two
+decode pods exposing the same eight ranks. Prefill has exactly one candidate
+for each rank; decode has two candidates for each rank.
 
 ## Tests
 
@@ -107,7 +114,8 @@ decode pods:
 2. **EPP hash:** use the same SGLang image, arguments, page size, cache flags,
    resources, topology, traffic input, rate, duration, and cache-warmup state as
    the fresh Lua arm. Remove the Lua rank-selection filter and select the
-   prefill virtual rank through `session-hash-scorer` instead.
+   prefill and decode virtual ranks through `session-hash-scorer` instead. The
+   decode pod remains load-selected among the two endpoints for that rank.
 
 The EPP-hash manifest must be derived from the fresh 1e engine configuration,
 not from the older 2f manifest, because 1e and 2f have differed in page size
@@ -119,12 +127,13 @@ uncached input tokens per second, and per-rank request distribution. Also
 retain the existing EPP scheduling and sidecar timing instrumentation.
 
 The primary correctness criterion is that known session IDs and the aggregate
-per-rank request distribution agree between Lua and EPP hash. Cache-hit rate
-and uncached input throughput should consequently be comparable. The observed
-latency and throughput delta is the cost of moving prefill rank selection into
-the EPP virtual-endpoint and sidecar path. Both arms already use EPP and the
-sidecar for decode, so the result is not the cost of adding those components to
-an otherwise component-free serving stack.
+prefill and decode per-rank request distributions agree between Lua and EPP
+hash. Cache-hit rate and uncached input throughput should consequently be
+comparable. The observed latency and throughput delta is the cost of moving
+prefill and decode rank selection into the EPP virtual-endpoint and sidecar
+path. Both arms already use EPP for decode-pod selection and the sidecar for P/D
+coordination, so the result is not the cost of adding those components to an
+otherwise component-free serving stack.
 
 ## Deliverables
 

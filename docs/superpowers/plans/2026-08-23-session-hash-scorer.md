@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement an EPP scorer that selects the same prefill DP rank as the Phase 1e Envoy Lua session hash, then measure the EPP virtual-rank routing overhead with a matched M3 comparison.
+**Goal:** Implement an EPP scorer that selects the same prefill and decode DP ranks as the Phase 1e Envoy Lua session hash, then measure the EPP virtual-rank routing overhead with a matched M3 comparison.
 
-**Architecture:** A stateless alpha scorer reads `session-id`, applies the exact byte-wise Lua polynomial hash, and scores only the endpoint whose `RankIndex` matches `hash % rankCount`. The live EPP-hash arm keeps the 1e SGLang configuration and decode routing but replaces Envoy's prefill-rank Lua selection with EPP virtual-rank selection.
+**Architecture:** A stateless alpha scorer reads `session-id`, applies the exact byte-wise Lua polynomial hash, and scores only endpoints whose `RankIndex` matches `hash % rankCount`. The live EPP-hash arm keeps the 1e SGLang configuration and replaces Envoy's prefill/decode-rank Lua selection with EPP virtual-rank selection; active-load scoring still chooses between the two decode pods exposing the selected rank.
 
 **Tech Stack:** Go, llm-d EPP plugin framework, Kubernetes/Envoy Gateway, SGLang, Python benchmark scripts.
 
@@ -13,7 +13,7 @@
 - Use the existing `/home/coder/llm-d-router-glm52-rank-aware-epp` worktree and preserve its unrelated dirty changes.
 - Use the exact modulus `2147483647`, multiplier `31`, UTF-8 header bytes, and `session-id` header.
 - Configure `rankCount: 8` for the experiment.
-- Keep decode load-aware and use one EPP replica, one prefill pod, and two decode pods.
+- Keep decode load-aware within the selected sticky rank and use one EPP replica, one prefill pod, and two decode pods.
 - Do not add generalized hashing configuration, state, or unrelated refactors.
 - Do not push or open a pull request.
 
@@ -159,9 +159,10 @@
 
   Copy the 1e manifest, preserve all SGLang image, argument, resource,
   topology, route, and cache settings, then make only the required routing
-  changes: eight prefill target ports, no Lua rank-selection policy, EPP
-  prefill role filter plus `session-hash-scorer` and `max-score-picker`, current
-  load-aware decode profile, and the new EPP image.
+  changes: eight target ports on prefill and decode, no Lua rank-selection
+  policy, EPP prefill role filter plus `session-hash-scorer` and
+  `max-score-picker`, decode role filter plus session hash weight `2`, active
+  request weight `1`, and `max-score-picker`, and the new EPP image.
 
 - [ ] **Step 3: Validate the manifest**
 
@@ -195,7 +196,7 @@
 
   Replace 1e with the EPP-hash manifest and wait for health. For several known
   session IDs, calculate the Lua target rank locally, send one request, and
-  verify the EPP/sidecar logs select that exact prefill rank.
+  verify the EPP/sidecar logs select that exact prefill and decode rank.
 
 - [ ] **Step 4: Run fresh EPP-hash M3**
 
@@ -227,10 +228,10 @@
 
 - [ ] **Step 3: State the bounded conclusion**
 
-  Attribute the measured delta to moving prefill selection through EPP virtual
-  endpoints and the sidecar while noting that both arms retain EPP/sidecar for
-  decode. Report any cache or rank mismatch as a failed isolation rather than
-  calling it overhead.
+  Attribute the measured delta to moving prefill and decode rank selection
+  through EPP virtual endpoints and the sidecar while noting that both arms
+  retain EPP decode-pod selection and P/D sidecar coordination. Report any
+  cache or rank mismatch as a failed isolation rather than calling it overhead.
 
 - [ ] **Step 4: Verify repository state**
 
