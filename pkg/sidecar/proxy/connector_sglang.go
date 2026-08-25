@@ -17,11 +17,13 @@ limitations under the License.
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"os"
@@ -38,7 +40,13 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
 )
 
-var sglangBootstrapPort int
+var (
+	sglangBootstrapPort           int
+	sglangInjectPrefillDPRankHint bool
+)
+
+const sglangInjectPrefillDPRankHintEnv = "SGLANG_INJECT_PREFILL_DP_RANK_HINT"
+const requestFieldDisaggPrefillDPRank = "disagg_prefill_dp_rank"
 
 func newFirstWriteResponseWriter(w http.ResponseWriter) (http.ResponseWriter, <-chan time.Time) {
 	firstWrite := make(chan time.Time, 1)
@@ -72,6 +80,21 @@ func init() {
 			sglangBootstrapPort = port
 		}
 	}
+	if enabled, err := strconv.ParseBool(os.Getenv(sglangInjectPrefillDPRankHintEnv)); err == nil {
+		sglangInjectPrefillDPRankHint = enabled
+	}
+}
+
+func dataParallelRankFromEndpoint(endpoint string, basePort, dpSize int) (int, bool) {
+	_, portText, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return 0, false
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < basePort || port >= basePort+dpSize {
+		return 0, false
+	}
+	return port - basePort, true
 }
 
 func (s *Server) handleSGLang(w http.ResponseWriter, r *http.Request, prefillPodHostPort string) {
@@ -206,7 +229,40 @@ func (s *Server) handleSGLangConcurrentRequests(w http.ResponseWriter, r *http.R
 	)
 	decodeStart := time.Now()
 
-	decodeReq := cloneRequestWithBody(decodeCtx, r, body)
+	decodeBody := body
+	if sglangInjectPrefillDPRankHint {
+		basePort := s.dpBasePort
+		if basePort != 0 {
+			if prefillRank, ok := dataParallelRankFromEndpoint(
+				prefillHost, basePort, s.config.DataParallelSize,
+			); ok {
+				decodeRequestData := make(map[string]interface{})
+				decoder := json.NewDecoder(bytes.NewReader(body))
+				decoder.UseNumber()
+				if err := decoder.Decode(&decodeRequestData); err != nil {
+					if err := errorJSONInvalid(err, w); err != nil {
+						s.logger.Error(err, "failed to send error response to client")
+					}
+					return
+				}
+				decodeRequestData[requestFieldDisaggPrefillDPRank] = prefillRank
+				var err error
+				decodeBody, err = json.Marshal(decodeRequestData)
+				if err != nil {
+					if err := errorJSONInvalid(err, w); err != nil {
+						s.logger.Error(err, "failed to send error response to client")
+					}
+					return
+				}
+				s.logger.V(4).Info("Added selected prefill DP rank hint to decode request",
+					"prefillEndpoint", prefillHost,
+					"prefillDPRank", prefillRank,
+					"decodeEndpoint", r.Header.Get(routing.DataParallelEndpointHeader),
+				)
+			}
+		}
+	}
+	decodeReq := cloneRequestWithBody(decodeCtx, r, decodeBody)
 	deferredWriter := newDeferredCommitWriter(w)
 	decodeWriter, firstWriteCh := newFirstWriteResponseWriter(deferredWriter)
 	decodeDone := make(chan time.Duration, 1)
