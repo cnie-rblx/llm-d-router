@@ -19,10 +19,12 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -213,6 +215,75 @@ var _ = Describe("SGLang Connector", func() {
 		Expect(selectedDecodeRequests.Load()).To(Equal(int32(1)))
 		Expect(defaultDecodeRequests.Load()).To(Equal(int32(0)))
 		Expect(<-prefillDataParallelTarget).To(Equal(prefillTarget))
+	})
+
+	It("should keep the EPP-selected decode rank while hinting the selected prefill rank", func() {
+		originalSetting := sglangInjectPrefillDPRankHint
+		sglangInjectPrefillDPRankHint = true
+		DeferCleanup(func() { sglangInjectPrefillDPRankHint = originalSetting })
+
+		var selectedDecodeRequests atomic.Int32
+		var coupledDecodeRequests atomic.Int32
+		prefillRequest := make(chan map[string]any, 1)
+		prefill := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]any
+			decoder := json.NewDecoder(r.Body)
+			decoder.UseNumber()
+			Expect(decoder.Decode(&body)).To(Succeed())
+			prefillRequest <- body
+			w.WriteHeader(http.StatusOK)
+		}))
+		DeferCleanup(prefill.Close)
+		prefillURL, err := url.Parse(prefill.URL)
+		Expect(err).NotTo(HaveOccurred())
+		prefillPort, err := strconv.Atoi(prefillURL.Port())
+		Expect(err).NotTo(HaveOccurred())
+
+		basePort := prefillPort - 7
+		originalDecodeEndpoint := "10.0.0.20:" + strconv.Itoa(basePort+1)
+		coupledDecodeEndpoint := "10.0.0.20:" + strconv.Itoa(prefillPort)
+		// Rank listeners override config.Port, but retain the rank-0 base port.
+		testInfo.proxy.config.Port = strconv.Itoa(prefillPort)
+		testInfo.proxy.dpBasePort = basePort
+		testInfo.proxy.config.DataParallelSize = 8
+		// Requests selected through virtual ports 8001-8007 run on a cloned
+		// server with forwardDataParallel disabled. The selected listener must
+		// continue to own decode routing even when the prefill-rank hint differs.
+		testInfo.proxy.forwardDataParallel = false
+		decodeRequest := make(chan map[string]any, 1)
+		testInfo.proxy.decoderProxy = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]any
+			decoder := json.NewDecoder(r.Body)
+			decoder.UseNumber()
+			Expect(decoder.Decode(&body)).To(Succeed())
+			Expect(r.Header.Get(routing.DataParallelEndpointHeader)).To(Equal(originalDecodeEndpoint))
+			decodeRequest <- body
+			selectedDecodeRequests.Add(1)
+			w.WriteHeader(http.StatusOK)
+		})
+		testInfo.proxy.dataParallelProxies[coupledDecodeEndpoint] = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			coupledDecodeRequests.Add(1)
+			w.WriteHeader(http.StatusOK)
+		})
+
+		req := httptest.NewRequest(http.MethodPost, ChatCompletionsPath,
+			bytes.NewBufferString(`{"model":"Qwen","messages":[{"role":"user","content":"Hello"}]}`))
+		req.Header.Set(routing.DataParallelEndpointHeader, originalDecodeEndpoint)
+		res := httptest.NewRecorder()
+		testInfo.proxy.handleSGLangConcurrentRequests(
+			res, req, []byte(`{"model":"Qwen","messages":[{"role":"user","content":"Hello"}],"bootstrap_room":1787598460057474549}`),
+			strings.TrimPrefix(prefill.URL, "http://"), 1234,
+		)
+
+		Expect(res.Code).To(Equal(http.StatusOK))
+		Expect(selectedDecodeRequests.Load()).To(Equal(int32(1)))
+		Expect(coupledDecodeRequests.Load()).To(Equal(int32(0)))
+		prefillBody := <-prefillRequest
+		decodeBody := <-decodeRequest
+		Expect(prefillBody).NotTo(HaveKey("disagg_prefill_dp_rank"))
+		Expect(decodeBody).To(HaveKeyWithValue("disagg_prefill_dp_rank", json.Number("7")))
+		Expect(prefillBody).To(HaveKeyWithValue("bootstrap_room", json.Number("1787598460057474549")))
+		Expect(decodeBody).To(HaveKeyWithValue("bootstrap_room", json.Number("1787598460057474549")))
 	})
 
 	It("cancels decode and returns the prefill HTTP error", func() {
