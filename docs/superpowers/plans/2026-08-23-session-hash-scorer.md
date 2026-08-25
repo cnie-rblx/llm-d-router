@@ -169,36 +169,23 @@
   Run a YAML parse, `kubectl apply --dry-run=server`, and a focused diff against
   1e. Verify that all non-routing SGLang arguments match exactly.
 
-### Task 4: Prove rank parity and run matched M3 traffic
+### Task 4: Prove rank parity and run EPP-hash M3 traffic
 
 **Files:**
-- Create: `/home/coder/lm-benchmark-llmd-test/build-traffic-replay/bench-results-controlled-m3-1e-sticky-rerun/`
 - Create: `/home/coder/lm-benchmark-llmd-test/build-traffic-replay/bench-results-controlled-m3-epp-session-hash/`
 
 **Interfaces:**
-- Consumes: both matched manifests and `bench_driver.py` with `m3`.
-- Produces: raw replay, analysis, observability, deployment-state, and log artifacts for both arms.
+- Consumes: the EPP-hash manifest, existing controlled 1e artifacts, and `bench_driver.py` with `m3`.
+- Produces: raw replay, analysis, observability, deployment-state, and log artifacts for the EPP-hash arm.
 
-- [ ] **Step 1: Record live state and replace the current deployment with fresh 1e**
+- [ ] **Step 1: Deploy EPP hash and prove known-session parity**
 
   Confirm cluster context and namespace, ensure no TrafficReplay is active,
-  delete the current comparison manifest, apply 1e, and wait for all 1P2D/EPP
-  pods and the HTTPRoute to become healthy.
-
-- [ ] **Step 2: Run fresh Lua M3**
-
-  Invoke the established driver with `m3` so it waits for idle, flushes all
-  prefill ranks, performs the standard two-conversation per-rank warmup, runs
-  15 minutes at QPS multiplier 3 and concurrency 400, and stores the complete
-  artifact set in the new rerun directory. Analyze the exact replay window.
-
-- [ ] **Step 3: Deploy EPP hash and prove known-session parity**
-
-  Replace 1e with the EPP-hash manifest and wait for health. For several known
+  apply the EPP-hash manifest, and wait for health. For several known
   session IDs, calculate the Lua target rank locally, send one request, and
   verify the EPP/sidecar logs select that exact prefill and decode rank.
 
-- [ ] **Step 4: Run fresh EPP-hash M3**
+- [ ] **Step 2: Run fresh EPP-hash M3**
 
   Run the identical driver procedure and save the complete artifact set in the
   EPP-hash directory. Record pod restarts and route conditions before and after.
@@ -210,7 +197,7 @@
 - Modify: `/home/coder/lm-benchmark-llmd-test/build-traffic-replay/REPORT-glm52-controlled-m3-routing-cache-comparison.md`
 
 **Interfaces:**
-- Consumes: fresh Lua and EPP-hash analysis/observability artifacts.
+- Consumes: the existing controlled 1e and fresh EPP-hash analysis/observability artifacts.
 - Produces: a reproducible statement of rank parity and observed prefill-routing overhead.
 
 - [ ] **Step 1: Validate artifact completeness**

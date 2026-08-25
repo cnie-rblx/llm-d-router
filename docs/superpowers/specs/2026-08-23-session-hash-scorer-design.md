@@ -107,17 +107,17 @@ the rank calculated locally with the Lua formula.
 
 ## Matched M3 Experiment
 
-Run two sequential, fresh M3 arms with one EPP replica, one prefill pod, and two
-decode pods:
+Compare one new M3 arm against the existing controlled 1e result. Both arms use
+one EPP replica, one prefill pod, and two decode pods:
 
-1. **Lua baseline:** rerun the 1e sticky-routing deployment.
+1. **Lua baseline:** reuse the recorded controlled 1e sticky-routing artifacts.
 2. **EPP hash:** use the same SGLang image, arguments, page size, cache flags,
    resources, topology, traffic input, rate, duration, and cache-warmup state as
    the fresh Lua arm. Remove the Lua rank-selection filter and select the
    prefill and decode virtual ranks through `session-hash-scorer` instead. The
    decode pod remains load-selected among the two endpoints for that rank.
 
-The EPP-hash manifest must be derived from the fresh 1e engine configuration,
+The EPP-hash manifest must be derived from the recorded 1e engine configuration,
 not from the older 2f manifest, because 1e and 2f have differed in page size
 and cache-related settings. Precise-prefix-cache scoring and its KV-event
 plumbing remain disabled in both matched arms.
@@ -140,7 +140,7 @@ otherwise component-free serving stack.
 - scorer implementation and focused tests in the llm-d router worktree;
 - an EPP image tag pinned in the experimental deployment;
 - matched Lua and EPP-hash manifests and raw M3 artifacts in
-  `/home/coder/lm-benchmark-llmd-test`;
+  `/home/coder/lm-benchmark-llmd-test`, reusing the existing Lua artifacts;
 - a short comparison section added to the existing controlled-routing report.
 
 No upstream push or pull request is part of this work unless explicitly
