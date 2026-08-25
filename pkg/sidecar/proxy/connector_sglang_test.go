@@ -18,10 +18,12 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -181,6 +183,14 @@ var _ = Describe("SGLang Connector", func() {
 	It("should dispatch decode to the data-parallel endpoint selected by EPP", func() {
 		var defaultDecodeRequests atomic.Int32
 		var selectedDecodeRequests atomic.Int32
+		prefillDataParallelTarget := make(chan string, 1)
+		prefill := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			prefillDataParallelTarget <- r.Header.Get(routing.DataParallelEndpointHeader)
+			w.WriteHeader(http.StatusOK)
+		}))
+		DeferCleanup(prefill.Close)
+		prefillTarget := strings.TrimPrefix(prefill.URL, "http://")
+
 		testInfo.proxy.decoderProxy = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			defaultDecodeRequests.Add(1)
 			w.WriteHeader(http.StatusOK)
@@ -198,10 +208,91 @@ var _ = Describe("SGLang Connector", func() {
 		res := httptest.NewRecorder()
 		body := []byte(`{"model":"Qwen","messages":[{"role":"user","content":"Hello"}]}`)
 
-		testInfo.proxy.handleSGLangConcurrentRequests(res, req, body,
-			testInfo.prefillBackend.URL[len("http://"):])
+		testInfo.proxy.handleSGLangConcurrentRequests(res, req, body, prefillTarget, 1234)
 
 		Expect(selectedDecodeRequests.Load()).To(Equal(int32(1)))
 		Expect(defaultDecodeRequests.Load()).To(Equal(int32(0)))
+		Expect(<-prefillDataParallelTarget).To(Equal(prefillTarget))
+	})
+
+	It("cancels decode and returns the prefill HTTP error", func() {
+		prefill := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"prefill failed"}`))
+		}))
+		DeferCleanup(prefill.Close)
+
+		var decodeCanceled atomic.Bool
+		testInfo.proxy.decoderProxy = http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done()
+			decodeCanceled.Store(true)
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		DeferCleanup(cancel)
+		req := httptest.NewRequest(http.MethodPost, ChatCompletionsPath,
+			bytes.NewBufferString(`{"model":"Qwen"}`)).WithContext(ctx)
+		req.Header.Set("x-request-id", "prefill-http-error")
+		res := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() {
+			defer GinkgoRecover()
+			defer close(done)
+			testInfo.proxy.handleSGLangConcurrentRequests(
+				res, req, []byte(`{"model":"Qwen"}`),
+				strings.TrimPrefix(prefill.URL, "http://"), 1234,
+			)
+		}()
+
+		Eventually(done, time.Second).Should(BeClosed())
+		Expect(res.Code).To(Equal(http.StatusInternalServerError))
+		Expect(res.Body.String()).To(Equal(`{"error":"prefill failed"}`))
+		Expect(decodeCanceled.Load()).To(BeTrue())
+	})
+
+	It("cancels decode and returns bad gateway on prefill transport failure", func() {
+		prefill := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		prefillTarget := strings.TrimPrefix(prefill.URL, "http://")
+		prefill.Close()
+
+		var decodeCanceled atomic.Bool
+		testInfo.proxy.decoderProxy = http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done()
+			decodeCanceled.Store(true)
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		DeferCleanup(cancel)
+		req := httptest.NewRequest(http.MethodPost, ChatCompletionsPath,
+			bytes.NewBufferString(`{"model":"Qwen"}`)).WithContext(ctx)
+		req.Header.Set("x-request-id", "prefill-transport-error")
+		res := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() {
+			defer GinkgoRecover()
+			defer close(done)
+			testInfo.proxy.handleSGLangConcurrentRequests(
+				res, req, []byte(`{"model":"Qwen"}`), prefillTarget, 5678,
+			)
+		}()
+
+		Eventually(done, time.Second).Should(BeClosed())
+		Expect(res.Code).To(Equal(http.StatusBadGateway))
+		Expect(decodeCanceled.Load()).To(BeTrue())
+	})
+
+	It("records the first decode response write once", func() {
+		res := httptest.NewRecorder()
+		writer, firstWrite := newFirstWriteResponseWriter(res)
+
+		writer.WriteHeader(http.StatusOK)
+		_, err := writer.Write([]byte("first"))
+		Expect(err).NotTo(HaveOccurred())
+		first := <-firstWrite
+
+		_, err = writer.Write([]byte("second"))
+		Expect(err).NotTo(HaveOccurred())
+		Consistently(firstWrite).ShouldNot(Receive())
+		Expect(first).NotTo(BeZero())
 	})
 })
