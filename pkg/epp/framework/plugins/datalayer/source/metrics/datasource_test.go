@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -89,4 +90,19 @@ func TestDatasource(t *testing.T) {
 	}, nil)
 	_, err = source.Poll(ctx, endpoint)
 	assert.NotNil(t, err, "expected to fail polling for metrics")
+}
+
+func TestParseMetricsRetainsValidFamiliesAfterMalformedHistogram(t *testing.T) {
+	payload := strings.NewReader(`# TYPE sglang:num_running_reqs gauge
+sglang:num_running_reqs 7
+# TYPE sglang:inter_token_latency_seconds histogram
+sglang:inter_token_latency_seconds_bucket{le="0.1"} -1
+sglang:inter_token_latency_seconds_bucket{le="+Inf"} -1
+sglang:inter_token_latency_seconds_sum 0.3
+sglang:inter_token_latency_seconds_count -1
+`)
+
+	families, err := parseMetrics(payload)
+	assert.NoError(t, err)
+	assert.Contains(t, families, "sglang:num_running_reqs")
 }
