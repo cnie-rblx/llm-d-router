@@ -23,20 +23,44 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
+	"github.com/felixge/httpsnoop"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
+	"github.com/llm-d/llm-d-router/pkg/common/routing"
 )
 
-var (
-	sglangBootstrapPort int
-)
+var sglangBootstrapPort int
+
+func newFirstWriteResponseWriter(w http.ResponseWriter) (http.ResponseWriter, <-chan time.Time) {
+	firstWrite := make(chan time.Time, 1)
+	var once sync.Once
+	record := func() {
+		once.Do(func() { firstWrite <- time.Now() })
+	}
+	return httpsnoop.Wrap(w, httpsnoop.Hooks{
+		Write: func(next httpsnoop.WriteFunc) httpsnoop.WriteFunc {
+			return func(body []byte) (int, error) {
+				record()
+				return next(body)
+			}
+		},
+		ReadFrom: func(next httpsnoop.ReadFromFunc) httpsnoop.ReadFromFunc {
+			return func(src io.Reader) (int64, error) {
+				record()
+				return next(src)
+			}
+		},
+	}), firstWrite
+}
 
 func init() {
 	// Default SGLang bootstrap port
@@ -77,15 +101,19 @@ func (s *Server) handleSGLang(w http.ResponseWriter, r *http.Request, prefillPod
 	}
 
 	// Send concurrent prefill and decode requests
-	s.handleSGLangConcurrentRequests(w, r, body, prefillPodHostPort)
+	s.handleSGLangConcurrentRequests(w, r, body, prefillPodHostPort, roomID)
 }
 
-func (s *Server) handleSGLangConcurrentRequests(w http.ResponseWriter, r *http.Request, body []byte, prefillHost string) {
+func (s *Server) handleSGLangConcurrentRequests(w http.ResponseWriter, r *http.Request, body []byte, prefillHost string, roomID int64) {
 	tracer := tracing.Tracer(tracerScope)
 	ctx := r.Context()
+	requestStart, _ := ctx.Value(requestStartTimeKey).(time.Time)
+	requestID := r.Header.Get(requestHeaderRequestID)
+	dispatchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	// Prefill Stage - async
-	ctx, prefillSpan := tracer.Start(ctx, "prefill",
+	prefillCtx, prefillSpan := tracer.Start(dispatchCtx, "prefill",
 		trace.WithSpanKind(trace.SpanKindInternal),
 	)
 	prefillSpan.SetAttributes(
@@ -95,11 +123,15 @@ func (s *Server) handleSGLangConcurrentRequests(w http.ResponseWriter, r *http.R
 	)
 	prefillStart := time.Now()
 
-	// Create separate requests for prefill and decode
-	// Use context.WithoutCancel for prefillReq to prevent it from being aborted
-	// if the main HTTP handler (which serves decodeReq) finishes first.
-	prefillReq := cloneRequestWithBody(context.WithoutCancel(r.Context()), r, body)
-	decodeReq := cloneRequestWithBody(r.Context(), r, body)
+	// Both legs share a cancelable context. Decode output is held until prefill
+	// succeeds, so a failed prefill can cancel decode without exposing a bogus
+	// success response to the client.
+	prefillReq := cloneRequestWithBody(prefillCtx, r, body)
+	// The incoming data-parallel endpoint selects the decode rank. The prefill
+	// sidecar must instead see its own selected virtual endpoint; otherwise rank
+	// 0's primary listener tries to find the decode pod in its local proxy map
+	// and returns 400. The decode request retains the original header below.
+	prefillReq.Header.Set(routing.DataParallelEndpointHeader, prefillHost)
 
 	prefillHandler, err := s.prefillerProxyHandler(prefillHost)
 	if err != nil {
@@ -111,7 +143,31 @@ func (s *Server) handleSGLangConcurrentRequests(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Send prefill request asynchronously
+	type prefillResult struct {
+		response       *bufferedResponseWriter
+		duration       time.Duration
+		transportError string
+	}
+	prefillDone := make(chan prefillResult, 1)
+
+	// Clone the cached reverse proxy before installing a request-scoped error
+	// handler. Mutating the shared proxy would race concurrent requests.
+	var transportError string
+	if proxy, ok := prefillHandler.(*httputil.ReverseProxy); ok {
+		proxyClone := *proxy
+		originalErrorHandler := proxy.ErrorHandler
+		proxyClone.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
+			transportError = err.Error()
+			if originalErrorHandler != nil {
+				originalErrorHandler(w, req, err)
+				return
+			}
+			w.WriteHeader(http.StatusBadGateway)
+		}
+		prefillHandler = &proxyClone
+	}
+
+	// Send prefill request asynchronously.
 	go func() {
 		defer prefillSpan.End()
 		defer func() {
@@ -130,10 +186,16 @@ func (s *Server) handleSGLangConcurrentRequests(w http.ResponseWriter, r *http.R
 			prefillSpan.SetStatus(codes.Error, "prefill request failed")
 		}
 		s.logger.V(5).Info("prefill request completed", "status", pw.statusCode)
+		prefillDone <- prefillResult{
+			response:       pw,
+			duration:       prefillDuration,
+			transportError: transportError,
+		}
 	}()
 
-	// Decode Stage - sync
-	ctx, decodeSpan := tracer.Start(ctx, "decode",
+	// Decode Stage - concurrent, with its response deferred until prefill wins
+	// the commit decision.
+	decodeCtx, decodeSpan := tracer.Start(dispatchCtx, "decode",
 		trace.WithSpanKind(trace.SpanKindInternal),
 	)
 	defer decodeSpan.End()
@@ -144,13 +206,71 @@ func (s *Server) handleSGLangConcurrentRequests(w http.ResponseWriter, r *http.R
 	)
 	decodeStart := time.Now()
 
-	// Send decode request synchronously
-	decodeReq = decodeReq.WithContext(ctx)
-	if !s.forwardDataParallel || !s.dataParallelHandler(w, decodeReq) {
-		s.decoderProxy.ServeHTTP(w, decodeReq)
+	decodeReq := cloneRequestWithBody(decodeCtx, r, body)
+	deferredWriter := newDeferredCommitWriter(w)
+	decodeWriter, firstWriteCh := newFirstWriteResponseWriter(deferredWriter)
+	decodeDone := make(chan time.Duration, 1)
+	go func() {
+		// Virtual-port servers bypass dataParallelHandler because their listener
+		// already identifies the independently EPP-selected decode rank.
+		dataParallelUsed := false
+		if s.forwardDataParallel {
+			dataParallelUsed = s.dataParallelHandler(decodeWriter, decodeReq)
+		}
+		if !dataParallelUsed {
+			s.decoderProxy.ServeHTTP(decodeWriter, decodeReq)
+		}
+		decodeDone <- time.Since(decodeStart)
+	}()
+
+	prefill := <-prefillDone
+	var decodeDuration time.Duration
+	if isHTTPError(prefill.response.statusCode) {
+		cancel()
+		deferredWriter.abort()
+		decodeDuration = <-decodeDone
+		for key, values := range prefill.response.Header() {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+		w.WriteHeader(prefill.response.statusCode)
+		if _, err := w.Write(prefill.response.bodyBytes()); err != nil {
+			s.logger.Error(err, "failed to send prefill error response to client")
+		}
+	} else {
+		deferredWriter.commit()
+		decodeDuration = <-decodeDone
 	}
 
-	decodeDuration := time.Since(decodeStart)
+	firstWriteDuration := time.Duration(-1)
+	select {
+	case firstWrite := <-firstWriteCh:
+		firstWriteDuration = firstWrite.Sub(decodeStart)
+	default:
+	}
+	prefillDuration := prefill.duration
+	setupDuration := time.Duration(-1)
+	totalDuration := time.Duration(-1)
+	requestStartText := ""
+	if !requestStart.IsZero() {
+		setupDuration = decodeStart.Sub(requestStart)
+		totalDuration = time.Since(requestStart)
+		requestStartText = requestStart.UTC().Format(time.RFC3339Nano)
+	}
+	s.logger.Info("SGLang P/D request timing",
+		"prefillTarget", prefillHost,
+		"prefillStatusCode", prefill.response.statusCode,
+		"prefillTransportError", prefill.transportError,
+		"bootstrapRoom", roomID,
+		"requestID", requestID,
+		"requestStart", requestStartText,
+		"setupDurationMs", float64(setupDuration)/float64(time.Millisecond),
+		"prefillUpstreamDurationMs", float64(prefillDuration)/float64(time.Millisecond),
+		"decodeFirstWriteDurationMs", float64(firstWriteDuration)/float64(time.Millisecond),
+		"decodeUpstreamDurationMs", float64(decodeDuration)/float64(time.Millisecond),
+		"totalDurationMs", float64(totalDuration)/float64(time.Millisecond),
+	)
 	decodeSpan.SetAttributes(
 		attribute.Float64("llm_d.pd_proxy.decode.duration_ms", float64(decodeDuration.Milliseconds())),
 		attribute.String("llm_d.pd_proxy.decode.target", s.config.DecoderURL.Host),
@@ -159,7 +279,7 @@ func (s *Server) handleSGLangConcurrentRequests(w http.ResponseWriter, r *http.R
 	// Calculate end-to-end P/D timing metrics for concurrent P/D.
 	// True TTFT captures time from gateway request start to decode start.
 	// In SGLang's concurrent mode, prefill duration is tracked in the async prefill span.
-	if currentSpan := trace.SpanFromContext(ctx); currentSpan.SpanContext().IsValid() {
+	if currentSpan := trace.SpanFromContext(decodeCtx); currentSpan.SpanContext().IsValid() {
 		var totalDuration time.Duration
 		var trueTTFT time.Duration
 		if requestStartValue := ctx.Value(requestStartTimeKey); requestStartValue != nil {
