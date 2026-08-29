@@ -34,11 +34,14 @@ const (
 	// DefaultMaxNumOfEndpoints is the fallback maximum number of endpoints to pick if not specified
 	// in the configuration.
 	DefaultMaxNumOfEndpoints = 1
+	// DefaultTopK is the fallback number of highest-scoring endpoints considered for selection.
+	DefaultTopK = 1
 )
 
 // PickerParameters defines the common parameters for all pickers
 type PickerParameters struct {
 	MaxNumOfEndpoints int `json:"maxNumOfEndpoints"`
+	TopK              int `json:"topK"`
 }
 
 type lockedRand struct {
