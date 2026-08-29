@@ -18,6 +18,8 @@ package maxscore
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -130,6 +132,111 @@ func TestPickMaxScorePicker(t *testing.T) {
 
 			if diff := cmp.Diff(test.output, got, cmp.Comparer(fwksched.ScoredEndpointComparer)); diff != "" {
 				t.Errorf("Unexpected output (-want +got): %v", diff)
+			}
+		})
+	}
+}
+
+func TestPickRandomlyWithinTopK(t *testing.T) {
+	endpoint1 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod1"}}, nil, nil)
+	endpoint2 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod2"}}, nil, nil)
+	endpoint3 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod3"}}, nil, nil)
+	endpoint4 := fwksched.NewEndpoint(&fwkdl.EndpointMetadata{ID: k8stypes.NamespacedName{Name: "pod4"}}, nil, nil)
+
+	tests := []struct {
+		name           string
+		topK           int
+		allowed        map[string]bool
+		wantAllSeen    bool
+		iterationCount int
+	}{
+		{
+			name:           "top one preserves highest score selection",
+			topK:           1,
+			allowed:        map[string]bool{"pod1": true},
+			wantAllSeen:    true,
+			iterationCount: 20,
+		},
+		{
+			name:           "top two samples only the two highest scores",
+			topK:           2,
+			allowed:        map[string]bool{"pod1": true, "pod2": true},
+			wantAllSeen:    true,
+			iterationCount: 500,
+		},
+		{
+			name:           "top three samples only the three highest scores",
+			topK:           3,
+			allowed:        map[string]bool{"pod1": true, "pod2": true, "pod3": true},
+			wantAllSeen:    true,
+			iterationCount: 500,
+		},
+		{
+			name:           "top k larger than candidates samples all candidates",
+			topK:           10,
+			allowed:        map[string]bool{"pod1": true, "pod2": true, "pod3": true, "pod4": true},
+			wantAllSeen:    true,
+			iterationCount: 500,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			p := NewMaxScorePicker(1).WithTopK(test.topK)
+			seen := make(map[string]bool)
+			for range test.iterationCount {
+				input := []*fwksched.ScoredEndpoint{
+					{Endpoint: endpoint1, Score: 40},
+					{Endpoint: endpoint2, Score: 30},
+					{Endpoint: endpoint3, Score: 20},
+					{Endpoint: endpoint4, Score: 10},
+				}
+				result := p.Pick(context.Background(), input)
+				if len(result.TargetEndpoints) != 1 {
+					t.Fatalf("expected one endpoint, got %d", len(result.TargetEndpoints))
+				}
+				name := result.TargetEndpoints[0].GetMetadata().ID.Name
+				if !test.allowed[name] {
+					t.Fatalf("selected endpoint %q outside top %d", name, test.topK)
+				}
+				seen[name] = true
+			}
+
+			if test.wantAllSeen && len(seen) != len(test.allowed) {
+				t.Fatalf("expected to observe every allowed endpoint, saw %v", seen)
+			}
+		})
+	}
+}
+
+func TestMaxScorePickerFactoryTopK(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   string
+		wantTopK int
+	}{
+		{name: "explicit top k", config: `{"maxNumOfEndpoints":1,"topK":3}`, wantTopK: 3},
+		{name: "omitted top k defaults to one", config: `{"maxNumOfEndpoints":1}`, wantTopK: 1},
+		{name: "invalid top k defaults to one", config: `{"maxNumOfEndpoints":1,"topK":0}`, wantTopK: 1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			decoder := json.NewDecoder(strings.NewReader(test.config))
+			plugin, err := MaxScorePickerFactory("decode-top3-picker", decoder, nil)
+			if err != nil {
+				t.Fatalf("factory returned error: %v", err)
+			}
+
+			p, ok := plugin.(*MaxScorePicker)
+			if !ok {
+				t.Fatalf("expected *MaxScorePicker, got %T", plugin)
+			}
+			if p.topK != test.wantTopK {
+				t.Fatalf("expected topK %d, got %d", test.wantTopK, p.topK)
+			}
+			if p.TypedName().Name != "decode-top3-picker" {
+				t.Fatalf("expected configured name, got %q", p.TypedName().Name)
 			}
 		})
 	}
