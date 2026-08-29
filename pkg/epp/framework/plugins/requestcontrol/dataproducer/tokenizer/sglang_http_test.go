@@ -56,23 +56,27 @@ func TestSGLangHTTPRenderer_Render(t *testing.T) {
 }
 
 func TestSGLangHTTPRenderer_RenderChat(t *testing.T) {
+	var requestBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]any
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-		require.Contains(t, body, "messages")
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&requestBody))
+		require.Contains(t, requestBody, "messages")
 		_ = json.NewEncoder(w).Encode(map[string]any{"tokens": []uint32{1, 2, 3}, "count": 3})
 	}))
 	defer server.Close()
 
 	renderer, err := newSGLangHTTPRenderer(&sglangConfig{URL: server.URL})
 	require.NoError(t, err)
-	tokens, features, err := renderer.RenderChat(context.Background(), fwkrh.PayloadMap{
+	payload := fwkrh.PayloadMap{
 		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
-	})
+		"stream":   true,
+	}
+	tokens, features, err := renderer.RenderChat(context.Background(), payload)
 
 	require.NoError(t, err)
 	assert.Equal(t, []uint32{1, 2, 3}, tokens)
 	assert.Nil(t, features)
+	assert.NotContains(t, requestBody, "stream")
+	assert.Equal(t, true, payload["stream"])
 }
 
 func TestSGLangHTTPRenderer_NonSuccess(t *testing.T) {
