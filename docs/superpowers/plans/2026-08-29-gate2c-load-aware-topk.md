@@ -29,7 +29,7 @@
 
 **Interfaces:**
 - Consumes: `picker.PickerParameters` JSON configuration and scored endpoint slices.
-- Produces: `PickerParameters.TopK int` and `NewMaxScorePicker(maxNumOfEndpoints, topK int) *MaxScorePicker`.
+- Produces: `PickerParameters.TopK int` and `(*MaxScorePicker).WithTopK(topK int) *MaxScorePicker`; the existing `NewMaxScorePicker(maxNumOfEndpoints int)` signature remains unchanged.
 
 - [ ] **Step 1: Add failing selection tests**
 
@@ -47,7 +47,7 @@ Expected: compilation or assertion failure because `TopK` and top-K sampling do 
 
 - [ ] **Step 3: Implement minimal picker support**
 
-Add `TopK int \`json:"topK"\`` to `PickerParameters`. Default it to 1 in the factory and constructor. After descending stable sort, clamp the top-K window to the candidate count, shuffle only that window, and then truncate to `maxNumOfEndpoints`.
+Add `TopK int \`json:"topK"\`` to `PickerParameters`. Default it to 1 in the factory and `WithTopK`. After descending stable sort, clamp the top-K window to the candidate count, shuffle only that window, and then truncate to `maxNumOfEndpoints`.
 
 - [ ] **Step 4: Run focused and related tests**
 

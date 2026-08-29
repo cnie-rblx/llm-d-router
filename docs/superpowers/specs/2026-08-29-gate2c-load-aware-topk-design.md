@@ -38,7 +38,7 @@ Reduce the prefill prefix-cache scorer weight from 1,000,000 to 2. Scorer output
 
 ### Top-K random selection
 
-Extend `max-score-picker` with an optional `topK` parameter:
+Extend `max-score-picker` with an optional `topK` parameter and preserve the existing `NewMaxScorePicker(maxNumOfEndpoints)` constructor:
 
 1. Shuffle candidates for random tie-breaking, as today.
 2. Sort candidates by descending score.
