@@ -265,8 +265,19 @@ func (s *Server) handleSGLangConcurrentRequests(w http.ResponseWriter, r *http.R
 	decodeReq := cloneRequestWithBody(decodeCtx, r, decodeBody)
 	deferredWriter := newDeferredCommitWriter(w)
 	decodeWriter, firstWriteCh := newFirstWriteResponseWriter(deferredWriter)
-	decodeDone := make(chan time.Duration, 1)
+	type decodeResult struct {
+		duration   time.Duration
+		panicValue any
+	}
+	decodeDone := make(chan decodeResult, 1)
 	go func() {
+		defer func() {
+			decodeDone <- decodeResult{
+				duration:   time.Since(decodeStart),
+				panicValue: recover(),
+			}
+		}()
+
 		// Virtual-port servers bypass dataParallelHandler because their listener
 		// already identifies the independently EPP-selected decode rank.
 		dataParallelUsed := false
@@ -276,15 +287,17 @@ func (s *Server) handleSGLangConcurrentRequests(w http.ResponseWriter, r *http.R
 		if !dataParallelUsed {
 			s.decoderProxy.ServeHTTP(decodeWriter, decodeReq)
 		}
-		decodeDone <- time.Since(decodeStart)
 	}()
 
 	prefill := <-prefillDone
-	var decodeDuration time.Duration
+	var decode decodeResult
 	if isHTTPError(prefill.response.statusCode) {
 		cancel()
 		deferredWriter.abort()
-		decodeDuration = <-decodeDone
+		decode = <-decodeDone
+		if decode.panicValue != nil && decode.panicValue != http.ErrAbortHandler {
+			panic(decode.panicValue)
+		}
 		for key, values := range prefill.response.Header() {
 			for _, value := range values {
 				w.Header().Add(key, value)
@@ -296,8 +309,12 @@ func (s *Server) handleSGLangConcurrentRequests(w http.ResponseWriter, r *http.R
 		}
 	} else {
 		deferredWriter.commit()
-		decodeDuration = <-decodeDone
+		decode = <-decodeDone
+		if decode.panicValue != nil {
+			panic(decode.panicValue)
+		}
 	}
+	decodeDuration := decode.duration
 
 	firstWriteDuration := time.Duration(-1)
 	select {

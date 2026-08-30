@@ -352,6 +352,27 @@ var _ = Describe("SGLang Connector", func() {
 		Expect(decodeCanceled.Load()).To(BeTrue())
 	})
 
+	It("propagates an abort-handler panic to the serving goroutine", func() {
+		prefill := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		DeferCleanup(prefill.Close)
+
+		testInfo.proxy.decoderProxy = http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			panic(http.ErrAbortHandler)
+		})
+
+		req := httptest.NewRequest(http.MethodPost, ChatCompletionsPath,
+			bytes.NewBufferString(`{"model":"Qwen"}`))
+		res := httptest.NewRecorder()
+		Expect(func() {
+			testInfo.proxy.handleSGLangConcurrentRequests(
+				res, req, []byte(`{"model":"Qwen"}`),
+				strings.TrimPrefix(prefill.URL, "http://"), 1234,
+			)
+		}).To(PanicWith(http.ErrAbortHandler))
+	})
+
 	It("records the first decode response write once", func() {
 		res := httptest.NewRecorder()
 		writer, firstWrite := newFirstWriteResponseWriter(res)
