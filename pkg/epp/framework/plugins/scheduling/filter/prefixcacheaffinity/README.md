@@ -59,10 +59,10 @@ Can be instantiated multiple times with different thresholds (e.g., 0.99 for glo
 - With probability `explorationProbability` (default 0, disabled), skip the gate entirely for exploration
 - TTFT load gate: if best sticky endpoint's TTFT exceeds best non-sticky by more than
   `maxTTFTPenaltyMs`, break stickiness and keep all endpoints (0 = always stick). The
-  per-endpoint TTFT is estimated from in-flight tokens as
-  `inFlightTokens / peakPrefillThroughput * 1000` (ms) when `ttftSource` is
-  `prefillThroughput` (default), or comes from the latency predictor when `ttftSource`
-  is `latencyPredictor`
+  per-endpoint TTFT is estimated as
+  `(inFlightTokens + uncachedRequestTokens) / peakPrefillThroughput * 1000` (ms)
+  when `ttftSource` is `prefillThroughput` (default), or comes from the latency
+  predictor when `ttftSource` is `latencyPredictor`
 - If no endpoints have the TTFT source attribute (`LatencyPredictionInfo` or `InFlightLoad`),
   the TTFT load gate is skipped. If no endpoints have `PrefixCacheMatchInfo`, all prefix
   scores default to 0 and no endpoints pass the affinity threshold, so all are kept (no-op)
@@ -86,7 +86,7 @@ to `latencyPredictor` to source TTFT from the latency predictor instead.
 ## Dependencies
 
 - Reads `PrefixCacheMatchInfo` from endpoint attributes (from `prefix-cache-scorer`)
-- Reads `InFlightLoad` for the TTFT load gate when `ttftSource` is `prefillThroughput` (from `in-flight-load-producer`)
+- Reads `InFlightLoad` and `UncachedRequestTokens` for the TTFT load gate when `ttftSource` is `prefillThroughput` (from `in-flight-load-producer`)
 - Reads `LatencyPredictionInfo` for the TTFT load gate when `ttftSource` is `latencyPredictor` (from `predicted-latency-producer`)
 
 **Configuration Example:**
