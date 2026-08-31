@@ -29,9 +29,9 @@
 
 - [ ] **Step 1: Write the failing projected-TTFT test**
 
-Add current-request uncached-token data to the test endpoint helper and create a
-case where the sticky endpoint has enough projected work to exceed
-`maxTTFTPenaltyMs` only after the current request is included.
+Add current-request uncached-token data to the test endpoints and create a case
+where committed load alone would break stickiness, but the non-sticky
+endpoint's much larger uncached request cost makes the sticky endpoint faster.
 
 - [ ] **Step 2: Verify the new test fails for the missing behavior**
 
