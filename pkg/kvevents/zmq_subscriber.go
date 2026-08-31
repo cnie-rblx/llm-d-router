@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"time"
 
 	zmq4 "github.com/go-zeromq/zmq4"
@@ -83,6 +84,30 @@ func parseEventFrame(frames [][]byte) (string, uint64, []byte, bool) {
 		return "", 0, nil, false
 	}
 	return string(frames[0]), binary.BigEndian.Uint64(frames[1]), frames[2], true
+}
+
+//nolint:gocritic // unnamedResult conflicts with nonamedreturns
+func parseReplayEventFrame(frames [][]byte, fallbackTopic string) (string, uint64, []byte, bool) {
+	if len(frames) == 2 {
+		if len(frames[0]) < 8 {
+			return "", 0, nil, false
+		}
+		return fallbackTopic, binary.BigEndian.Uint64(frames[0]), frames[1], true
+	}
+	return parseEventFrame(frames)
+}
+
+func isReplayTerminalFrame(frames [][]byte) bool {
+	switch len(frames) {
+	case 2:
+		return len(frames[0]) >= 8 &&
+			binary.BigEndian.Uint64(frames[0]) == math.MaxUint64 && len(frames[1]) == 0
+	case 3:
+		return len(frames[0]) == 0 && len(frames[1]) >= 8 &&
+			binary.BigEndian.Uint64(frames[1]) == math.MaxUint64 && len(frames[2]) == 0
+	default:
+		return false
+	}
 }
 
 // Start connects to a ZMQ PUB socket as a SUB, receives messages,
@@ -348,12 +373,12 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 			if len(frames) > 0 && len(frames[0]) == 0 {
 				frames = frames[1:]
 			}
-			if len(frames) == 3 && len(frames[2]) == 0 {
+			if isReplayTerminalFrame(frames) {
 				complete = true
 				break
 			}
 
-			topic, seq, payload, ok := parseEventFrame(frames)
+			topic, seq, payload, ok := parseReplayEventFrame(frames, z.topicFilter)
 			if !ok {
 				terminalErr = fmt.Errorf("malformed replay frame with %d frames", len(frames))
 				break

@@ -170,7 +170,6 @@ func (b *replayBuffer) set(messages ...replayMessage) {
 func startReplayBuffer(t *testing.T, ctx context.Context, endpoint string) *replayBuffer {
 	t.Helper()
 	buffer := &replayBuffer{}
-	topic := []byte("kv@10.0.0.1:8000@TestModel")
 
 	router := zmq4.NewRouter(ctx)
 	require.NoError(t, router.Listen(endpoint))
@@ -213,7 +212,7 @@ func startReplayBuffer(t *testing.T, ctx context.Context, endpoint string) *repl
 					time.Sleep(messageDelay)
 				}
 				if err := router.Send(zmq4.NewMsgFrom(
-					clientID, []byte{}, topic, seqFrame(replay.seq), replay.payload,
+					clientID, []byte{}, seqFrame(replay.seq), replay.payload,
 				)); err != nil {
 					return
 				}
@@ -226,7 +225,7 @@ func startReplayBuffer(t *testing.T, ctx context.Context, endpoint string) *repl
 				continue
 			}
 			if err := router.Send(zmq4.NewMsgFrom(
-				clientID, []byte{}, []byte{}, seqFrame(math.MaxUint64), []byte{},
+				clientID, []byte{}, seqFrame(math.MaxUint64), []byte{},
 			)); err != nil {
 				return
 			}
@@ -504,9 +503,10 @@ func newReplayHarnessWithBehavior(
 	buffer.mu.Unlock()
 	buffer.partialOnce.Store(partialAfter > 0)
 
+	topic := []byte("kv@10.0.0.1:8000@TestModel")
 	subManager := kvevents.NewSubscriberManager(pool)
 	require.NoError(t, subManager.EnsureSubscriber(
-		ctx, "test-pod", "10.0.0.1:8000", pubEndpoint, replayEndpoint, "kv@", false))
+		ctx, "test-pod", "10.0.0.1:8000", pubEndpoint, replayEndpoint, string(topic), false))
 	require.Eventually(t, func() bool { return buffer.requests.Load() == 1 },
 		5*time.Second, 50*time.Millisecond, "proactive replay expected")
 
@@ -525,7 +525,7 @@ func newReplayHarnessWithBehavior(
 		index:  index,
 		buffer: buffer,
 		pub:    pub,
-		topic:  []byte("kv@10.0.0.1:8000@TestModel"),
+		topic:  topic,
 	}
 }
 
