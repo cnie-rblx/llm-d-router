@@ -136,46 +136,28 @@ git add pkg/epp/framework/plugins/scheduling/filter/decodepipelinepressure
 git commit -s -m "Add decode pipeline pressure filter"
 ```
 
-### Task 2: Register the plugin and verify configuration loading
+### Task 2: Register the plugin and verify runner wiring
 
 **Files:**
 - Modify: `cmd/epp/runner/runner.go`
-- Modify: `pkg/epp/config/loader/configloader_test.go`
+- Create: `cmd/epp/runner/decode_pipeline_pressure_filter_test.go`
 
 **Interfaces:**
 - Consumes: `decodepipelinepressure.PluginType` and `decodepipelinepressure.Factory` from Task 1.
-- Produces: runner registration that permits `type: decode-pipeline-pressure-filter` in EPP configuration.
+- Produces: runner registration that exposes `type: decode-pipeline-pressure-filter` as an alpha plugin.
 
-- [ ] **Step 1: Write a failing configuration-loader test**
+- [ ] **Step 1: Write a failing runner registration test**
 
-Add a minimal plugin declaration and decode scheduling profile using:
-
-```yaml
-- type: decode-pipeline-pressure-filter
-  name: decode-pipeline-pressure-filter
-  parameters:
-    threshold: 0.75
-    ordinaryWaiting:
-      weight: 2
-      fixedRange: {min: 0, max: 4}
-    prealloc:
-      attributeKey: sglang.decode_prealloc_queue_reqs
-      weight: 2
-      fixedRange: {min: 1, max: 8}
-    transfer:
-      attributeKey: sglang.decode_transfer_queue_reqs
-      weight: 1
-      fixedRange: {min: 2, max: 12}
-```
-
-Assert configuration loading succeeds and the filter appears before the active-request scorer in the decode profile.
+Call `registerInTreePlugins`, then assert the registry contains
+`decodepipelinepressure.PluginType` at alpha stability. The filter's factory
+tests already exercise the public JSON configuration field names.
 
 - [ ] **Step 2: Run the focused test and verify RED**
 
 Run:
 
 ```bash
-go test ./pkg/epp/config/loader -run TestDecodePipelinePressureFilterConfiguration -count=1
+go test ./cmd/epp/runner -run TestDecodePipelinePressureFilterRegistered -count=1
 ```
 
 Expected: fail because the plugin type is not registered.
@@ -199,7 +181,6 @@ Place it with the other alpha scheduling filters.
 Run:
 
 ```bash
-go test ./pkg/epp/config/loader -run 'TestDecodePipelinePressureFilterConfiguration|TestFilterExecutionOrderFromYAML' -count=1
 go test ./cmd/epp/runner ./pkg/epp/framework/plugins/scheduling/filter/...
 ```
 
@@ -210,7 +191,7 @@ Expected: PASS.
 Run:
 
 ```bash
-git add cmd/epp/runner/runner.go pkg/epp/config/loader/configloader_test.go
+git add cmd/epp/runner/runner.go cmd/epp/runner/decode_pipeline_pressure_filter_test.go
 git commit -s -m "Register decode pipeline pressure filter"
 ```
 
@@ -227,7 +208,7 @@ git commit -s -m "Register decode pipeline pressure filter"
 
 ```bash
 make format
-go test ./pkg/epp/framework/plugins/scheduling/filter/decodepipelinepressure ./pkg/epp/config/loader ./cmd/epp/runner
+go test ./pkg/epp/framework/plugins/scheduling/filter/decodepipelinepressure ./cmd/epp/runner
 ```
 
 Expected: PASS with no formatting diff outside touched files.
