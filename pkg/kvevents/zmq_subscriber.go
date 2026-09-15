@@ -57,6 +57,10 @@ type zmqSubscriber struct {
 	lastLiveSeq       uint64
 	hasLastLiveSeq    bool
 	lastReplayFailure time.Time
+	// liveOnly stops cold-start replay attempts after one has failed, so the
+	// index is rebuilt from live events instead of being cleared on every
+	// cooldown. See the fallback in receiveLoop for why this is safe.
+	liveOnly bool
 }
 
 // newZMQSubscriber creates a new ZMQ subscriber.
@@ -174,10 +178,14 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 	}
 
 	// Rebuild the index from buffered events without waiting for live traffic.
-	if z.replayEndpoint != "" && !z.hasLastSeq && z.canAttemptReplay() {
+	if z.replayEndpoint != "" && !z.hasLastSeq && !z.liveOnly && z.canAttemptReplay() {
 		logger.Info("Requesting proactive replay on connect",
 			"endpoint", z.endpoint, "replayEndpoint", z.replayEndpoint)
-		z.requestReplay(ctx, 0)
+		if !z.requestReplay(ctx, 0) {
+			logger.Info("Proactive replay failed, falling back to indexing live events",
+				"endpoint", z.endpoint, "replayEndpoint", z.replayEndpoint)
+			z.liveOnly = true
+		}
 	}
 
 	debugLogger := logger.V(logging.DEBUG)
@@ -213,8 +221,13 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			z.lastSeq = 0
 			z.hasLastSeq = false
 			z.lastReplayFailure = time.Time{}
+			// A restarted engine starts a fresh, short buffer, so a full replay
+			// can succeed again even if it failed for the previous lifetime.
+			z.liveOnly = false
 			replayAttempted = true
-			z.requestReplay(ctx, 0)
+			if !z.requestReplay(ctx, 0) {
+				z.liveOnly = true
+			}
 		}
 
 		if z.hasLastLiveSeq && seq == z.lastLiveSeq {
@@ -245,13 +258,31 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 		}
 
 		if !z.hasLastSeq && seq > 0 {
-			if replayAttempted || !z.canAttemptReplay() {
+			switch {
+			case z.liveOnly:
+				// History replay is only a warmup optimisation, and some engines
+				// page their replay buffer such that a cold replay can never be
+				// contiguous. Indexing from here instead is strictly safe: the
+				// pod was cleared when the replay failed, a removal for a block
+				// we never recorded is a no-op, and every eviction from this
+				// point on is observed. The index under-reports until traffic
+				// refills it, but it never claims a block is resident when it
+				// is not.
+				debugLogger.Info("Indexing live events without replay",
+					"currentSeq", seq, "endpoint", z.endpoint)
+				z.lastSeq = seq - 1
+				z.hasLastSeq = true
+			case replayAttempted || !z.canAttemptReplay():
 				continue
-			}
-			logger.Info("Joining mid-stream, requesting full replay",
-				"currentSeq", seq, "endpoint", z.endpoint)
-			if !z.requestReplay(ctx, 0) {
-				continue
+			default:
+				logger.Info("Joining mid-stream, requesting full replay",
+					"currentSeq", seq, "endpoint", z.endpoint)
+				if !z.requestReplay(ctx, 0) {
+					logger.Info("Full replay failed, falling back to indexing live events",
+						"currentSeq", seq, "endpoint", z.endpoint)
+					z.liveOnly = true
+					continue
+				}
 			}
 		}
 
