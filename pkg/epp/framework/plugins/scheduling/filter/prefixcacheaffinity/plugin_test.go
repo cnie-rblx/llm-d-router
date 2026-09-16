@@ -57,6 +57,7 @@ func newTestPlugin(config Config) *Plugin {
 		prefixMatchDataKey:           attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(config.PrefixMatchInfoProducerName),
 		latencyPredictionInfoDataKey: attrlatency.LatencyPredictionInfoDataKey.WithNonEmptyProducerName(config.LatencyPredictionInfoProducerName),
 		inFlightLoadDataKey:          attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(config.InFlightLoadProducerName),
+		uncachedRequestTokensDataKey: attrconcurrency.UncachedRequestTokensDataKey.WithNonEmptyProducerName(config.InFlightLoadProducerName),
 	}
 }
 
@@ -132,6 +133,19 @@ func TestFilter_ThroughputTTFTWithinThreshold(t *testing.T) {
 	assert.Equal(t, "a", result[0].GetMetadata().ID.Name)
 }
 
+func TestFilter_ThroughputTTFTIncludesCurrentRequest(t *testing.T) {
+	p := newTestPlugin(Config{AffinityThreshold: 0.80, ExplorationProbability: 0, MaxTTFTPenaltyMs: 100, TTFTSource: TTFTSourcePrefillThroughput, PeakPrefillThroughput: 1000})
+	sticky := makeEndpoint("sticky", 90, 10, 500)
+	nonSticky := makeEndpoint("non-sticky", 10, 10, 50)
+	sticky.Put(attrconcurrency.UncachedRequestTokensDataKey.String(), &attrconcurrency.UncachedRequestTokens{Tokens: 100})
+	nonSticky.Put(attrconcurrency.UncachedRequestTokensDataKey.String(), &attrconcurrency.UncachedRequestTokens{Tokens: 1000})
+
+	result := p.Filter(context.Background(), nil, []fwksched.Endpoint{sticky, nonSticky})
+
+	assert.Equal(t, []fwksched.Endpoint{sticky}, result,
+		"projected uncached work should keep the lower-TTFT sticky endpoint")
+}
+
 func TestFilter_TTFTPenaltyDisabled(t *testing.T) {
 	p := newTestPlugin(Config{AffinityThreshold: 0.80, ExplorationProbability: 0, MaxTTFTPenaltyMs: 0, TTFTSource: TTFTSourcePrefillThroughput, PeakPrefillThroughput: 1000})
 	endpoints := []fwksched.Endpoint{
@@ -177,6 +191,8 @@ func TestConsumes_ConditionalAttributes(t *testing.T) {
 	assert.True(t, ok)
 	_, ok = consumed.Required[p.latencyPredictionInfoDataKey]
 	assert.False(t, ok)
+	_, ok = consumed.Required[p.uncachedRequestTokensDataKey]
+	assert.True(t, ok)
 }
 
 func TestFactory_ValidConfig(t *testing.T) {

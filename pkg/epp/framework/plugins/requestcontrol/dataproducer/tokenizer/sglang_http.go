@@ -115,7 +115,9 @@ func (r *sglangHTTPRenderer) RenderChat(ctx context.Context, payload fwkrh.Reque
 	if !ok {
 		return nil, nil, errors.New("SGLang HTTP tokenizer requires a parsed PayloadMap")
 	}
-	resp, err := r.tokenize(ctx, pm, r.chatTimeout(pm))
+	body := maps.Clone(pm)
+	delete(body, "stream")
+	resp, err := r.tokenize(ctx, body, r.chatTimeout(pm))
 	if err != nil {
 		return nil, nil, err
 	}

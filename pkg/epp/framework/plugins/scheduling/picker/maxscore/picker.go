@@ -44,14 +44,17 @@ var _ fwksched.Picker = &MaxScorePicker{}
 
 // MaxScorePickerFactory defines the factory function for MaxScorePicker.
 func MaxScorePickerFactory(name string, rawParameters *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
-	parameters := picker.PickerParameters{MaxNumOfEndpoints: picker.DefaultMaxNumOfEndpoints}
+	parameters := picker.PickerParameters{
+		MaxNumOfEndpoints: picker.DefaultMaxNumOfEndpoints,
+		TopK:              picker.DefaultTopK,
+	}
 	if rawParameters != nil {
 		if err := rawParameters.Decode(&parameters); err != nil {
 			return nil, fmt.Errorf("failed to parse the parameters of the '%s' picker - %w", MaxScorePickerType, err)
 		}
 	}
 
-	return NewMaxScorePicker(parameters.MaxNumOfEndpoints).WithName(name), nil
+	return NewMaxScorePicker(parameters.MaxNumOfEndpoints).WithTopK(parameters.TopK).WithName(name), nil
 }
 
 // NewMaxScorePicker initializes a new MaxScorePicker and returns its pointer.
@@ -63,6 +66,7 @@ func NewMaxScorePicker(maxNumOfEndpoints int) *MaxScorePicker {
 	return &MaxScorePicker{
 		typedName:         fwkplugin.TypedName{Type: MaxScorePickerType, Name: MaxScorePickerType},
 		maxNumOfEndpoints: maxNumOfEndpoints,
+		topK:              picker.DefaultTopK,
 	}
 }
 
@@ -70,11 +74,21 @@ func NewMaxScorePicker(maxNumOfEndpoints int) *MaxScorePicker {
 type MaxScorePicker struct {
 	typedName         fwkplugin.TypedName
 	maxNumOfEndpoints int // maximum number of endpoints to pick
+	topK              int // number of highest-scoring endpoints eligible for randomized selection
 }
 
 // WithName sets the picker's name
 func (p *MaxScorePicker) WithName(name string) *MaxScorePicker {
 	p.typedName.Name = name
+	return p
+}
+
+// WithTopK sets the number of highest-scoring endpoints eligible for randomized selection.
+func (p *MaxScorePicker) WithTopK(topK int) *MaxScorePicker {
+	if topK <= 0 {
+		topK = picker.DefaultTopK
+	}
+	p.topK = topK
 	return p
 }
 
@@ -100,6 +114,17 @@ func (p *MaxScorePicker) Pick(ctx context.Context, scoredEndpoints []*fwksched.S
 		}
 		return 0
 	})
+
+	// Randomize the eligible top-K set when it is larger than the requested output. Keeping the
+	// sorted order when maxNumOfEndpoints already covers topK preserves the legacy multi-endpoint
+	// behavior.
+	topK := max(p.topK, p.maxNumOfEndpoints)
+	if topK > len(scoredEndpoints) {
+		topK = len(scoredEndpoints)
+	}
+	if topK > p.maxNumOfEndpoints {
+		picker.ShuffleScoredEndpoints(scoredEndpoints[:topK])
+	}
 
 	// if we have enough endpoints to return keep only the "maxNumOfEndpoints" highest scored endpoints
 	if p.maxNumOfEndpoints < len(scoredEndpoints) {

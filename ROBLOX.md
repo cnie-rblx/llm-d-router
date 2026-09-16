@@ -21,3 +21,23 @@ Adds a Kubernetes ConfigMap-backed syncer for sharing in-flight request state ac
 ## Reliability fixes
 
 Retains valid metrics parsed before a malformed metric family and cancels decode work when prefill fails. These changes avoid discarding usable load signals and prevent orphaned decode requests.
+
+## Load-aware top-K selection
+
+Extends the max-score picker with `topK` so it can select randomly from the highest-scoring endpoints. This reduces hot-spotting while retaining score locality.
+
+## SGLang request compatibility
+
+Omits the unsupported `stream` field from SGLang tokenization requests. The sidecar also treats client-aborted decode streams as request cancellation instead of terminating the process.
+
+## SGLang replay compatibility
+
+Accepts replay frames that omit the topic and uses the subscriber's configured topic as a fallback. Both topicful and topicless terminal frames are recognized.
+
+## Projected TTFT affinity
+
+Includes the current request's uncached tokens when estimating prefill TTFT for prefix-affinity routing. This prevents a large incoming request from appearing artificially cheap before it enters the in-flight counters.
+
+## Decode pipeline pressure
+
+Adds a filter that combines ordinary waiting, decode preallocation, and transfer queues into normalized endpoint pressure. It keeps endpoints within a configurable threshold of the least-pressured decode endpoint.
