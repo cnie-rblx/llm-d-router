@@ -18,7 +18,6 @@ package preciseprefixcache
 
 import (
 	"fmt"
-	"slices"
 
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -40,72 +39,138 @@ func extractEndpointSet(endpoints []scheduling.Endpoint) sets.Set[string] {
 	return endpointSet
 }
 
-// matchedBlockCount returns the number of contiguous cached prefix blocks held
-// by podID, counting from the first block until the first block the pod does
-// not hold. This is the unweighted counterpart of the device-tier-weighted
-// kvblock scorer: every cached block counts as one regardless of device tier,
-// so a pod present at keys[0..n-1] yields n.
-//
-// Blocks no pod is known to hold are skipped, not counted and not treated as
-// a miss, matching kvcache.LongestPrefixScorer: the index only learns a block
-// when an engine announces a new store, so permanently resident blocks are
-// absent for every pod and must not end the chain.
-func matchedBlockCount(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry, podID string) int {
-	count := 0
-	for _, key := range keys {
-		entries := keyToPods[key]
-		if len(entries) == 0 {
-			continue // unknown to the index, not a miss
-		}
-		if !slices.ContainsFunc(entries, func(e kvblock.PodEntry) bool { return e.PodIdentifier == podID }) {
-			break
-		}
-		count++
-	}
-	return count
+// endpointPrefixCount holds one endpoint's contiguous cached-block counts for
+// a single key list.
+type endpointPrefixCount struct {
+	blocks int
+	byTier map[string]int
 }
 
-// matchedBlockCountByTier returns, per device tier, the number of contiguous
-// cached prefix blocks podID holds in that tier, counting from the first
-// block until the first block the pod does not hold in that tier. A block
-// held in several tiers counts once per tier, so each tier's count is at most
-// matchedBlockCount for the same pod. Tiers are recorded as found in the
-// index, except speculative entries, which count under
-// attrprefix.SpeculativeTierKey: PreRequest inserts them before vLLM has
-// reported placement, so they carry no device tier.
+// tierBitLimit caps how many distinct device tiers the bitmask below can
+// track. sglang reports gpu, cpu_pinned and the speculative pseudo-tier, so
+// this is far beyond anything real; tiers past the limit are ignored rather
+// than silently miscounted.
+const tierBitLimit = 64
+
+// matchedPrefixCounts returns, for every endpoint at once, the number of
+// contiguous cached prefix blocks it holds: `blocks` counts a block held in
+// any device tier, and `byTier` counts per tier, so each tier's count is at
+// most `blocks`. A pod present at keys[0..n-1] yields n. Speculative entries
+// count under attrprefix.SpeculativeTierKey, since PreRequest inserts them
+// before vLLM has reported placement and they carry no device tier.
 //
-// Blocks no pod is known to hold are skipped rather than ending the chain,
-// for the same reason as matchedBlockCount.
-// Returns a non-nil (possibly empty) map.
-func matchedBlockCountByTier(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry, podID string) map[string]int {
-	counts := map[string]int{}
-	var alive sets.Set[string]
+// Blocks that no pod is known to hold are skipped: they neither seed nor
+// break any chain. The index is not authoritative about absence, because
+// engines announce a block only when it is newly stored, so a block resident
+// since before the index was built is never announced and is missing for
+// every pod. A block that some pods hold and this one does not is still a
+// genuine miss and ends this pod's chain.
+//
+// This is computed in a SINGLE pass over keys for all endpoints together.
+// Doing it per endpoint is O(endpoints x keys x entries) and, with a set
+// allocated per key per endpoint, cost 11.5 MB and 7.7 ms per request at
+// production shape (1,400 keys, 16 endpoints) -- enough to OOM-kill the EPP.
+// The per-endpoint form was only ever cheap because anchoring on keys[0] made
+// it exit immediately. See oombench_test.go, which guards this.
+func matchedPrefixCounts(keys []kvblock.BlockHash,
+	keyToPods map[kvblock.BlockHash][]kvblock.PodEntry,
+) map[string]*endpointPrefixCount {
+	counts := make(map[string]*endpointPrefixCount)
+	if len(keys) == 0 {
+		return counts
+	}
+
+	// Tier name to bit position, built lazily as tiers are encountered.
+	tierBit := make(map[string]uint, 4)
+	tierName := make([]string, 0, 4)
+
+	// Scratch, reused across keys via clear() so the pass allocates nothing
+	// per key: endpoint -> bitmask of the tiers holding the current block.
+	presentMask := make(map[string]uint64)
+
+	// Two independent chains per endpoint, because the any-tier count and the
+	// per-tier counts break at different points: the any-tier chain ends when
+	// the endpoint does not hold the block in ANY tier, while a given tier's
+	// chain ends as soon as the endpoint does not hold the block in THAT tier.
+	aliveAny := make(map[string]bool)
+	aliveMask := make(map[string]uint64)
+	liveAny, liveMask := 0, 0
+	seeded := false
+
 	for _, key := range keys {
 		entries := keyToPods[key]
 		if len(entries) == 0 {
 			continue // unknown to the index, not a miss
 		}
-		tiersAtKey := sets.New[string]()
+
+		clear(presentMask)
 		for _, e := range entries {
-			if e.PodIdentifier == podID {
-				if e.Speculative {
-					tiersAtKey.Insert(attrprefix.SpeculativeTierKey)
+			tier := e.DeviceTier
+			if e.Speculative {
+				tier = attrprefix.SpeculativeTierKey
+			}
+			bit, ok := tierBit[tier]
+			if !ok {
+				if len(tierName) >= tierBitLimit {
+					continue
+				}
+				bit = uint(len(tierName))
+				tierBit[tier] = bit
+				tierName = append(tierName, tier)
+			}
+			presentMask[e.PodIdentifier] |= 1 << bit
+		}
+
+		if !seeded {
+			seeded = true
+			for pod, mask := range presentMask {
+				c := &endpointPrefixCount{blocks: 1, byTier: make(map[string]int, 2)}
+				for b, name := range tierName {
+					if mask&(1<<uint(b)) != 0 {
+						c.byTier[name] = 1
+					}
+				}
+				counts[pod] = c
+				aliveAny[pod] = true
+				aliveMask[pod] = mask
+				liveAny++
+				liveMask++
+			}
+			continue
+		}
+
+		for pod, c := range counts {
+			mask := presentMask[pod] // absent endpoints read as 0
+
+			if aliveAny[pod] {
+				if mask != 0 {
+					c.blocks++
 				} else {
-					tiersAtKey.Insert(e.DeviceTier)
+					aliveAny[pod] = false
+					liveAny--
+				}
+			}
+
+			if am := aliveMask[pod]; am != 0 {
+				nm := am & mask
+				aliveMask[pod] = nm
+				if nm == 0 {
+					liveMask--
+				} else {
+					for b, name := range tierName {
+						if nm&(1<<uint(b)) != 0 {
+							c.byTier[name]++
+						}
+					}
 				}
 			}
 		}
-		if alive == nil {
-			alive = tiersAtKey
-		} else {
-			alive = alive.Intersection(tiersAtKey)
-		}
-		if alive.Len() == 0 {
+
+		// Every chain has ended; remaining keys cannot change the result.
+		if liveAny == 0 && liveMask == 0 {
 			break
 		}
-		for tier := range alive {
-			counts[tier]++
-		}
 	}
+
 	return counts
 }

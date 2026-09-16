@@ -40,12 +40,15 @@ func benchFixture() ([]kvblock.BlockHash, map[kvblock.BlockHash][]kvblock.PodEnt
 	return keys, keyToPods, pods
 }
 
-// oldMatchedBlockCountByTier is the pre-fix implementation, kept here only to
-// measure the cost the fix introduced.
-func oldMatchedBlockCountByTier(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry, podID string) map[string]int {
+// naiveMatchedBlockCountByTier is block-0 tolerance bolted onto the old
+// per-endpoint scan: correct, but it allocates two sets per key per endpoint.
+func naiveMatchedBlockCountByTier(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry, podID string) map[string]int {
 	counts := map[string]int{}
 	var alive sets.Set[string]
 	for _, key := range keys {
+		if len(keyToPods[key]) == 0 {
+			continue
+		}
 		tiersAtKey := sets.New[string]()
 		for _, e := range keyToPods[key] {
 			if e.PodIdentifier == podID {
@@ -71,10 +74,14 @@ func oldMatchedBlockCountByTier(keys []kvblock.BlockHash, keyToPods map[kvblock.
 	return counts
 }
 
-func oldMatchedBlockCount(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry, podID string) int {
+func naiveMatchedBlockCount(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry, podID string) int {
 	count := 0
 	for _, key := range keys {
-		if !slices.ContainsFunc(keyToPods[key], func(e kvblock.PodEntry) bool { return e.PodIdentifier == podID }) {
+		entries := keyToPods[key]
+		if len(entries) == 0 {
+			continue
+		}
+		if !slices.ContainsFunc(entries, func(e kvblock.PodEntry) bool { return e.PodIdentifier == podID }) {
 			break
 		}
 		count++
@@ -82,26 +89,26 @@ func oldMatchedBlockCount(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockH
 	return count
 }
 
-// One "request" is what produceFromBlockKeys does: both counters for every
-// endpoint over the whole key list.
-func BenchmarkPerRequestOld(b *testing.B) {
+// BenchmarkPerRequestNaive is the shape that OOM-killed the EPP: block-0
+// tolerance bolted onto the per-endpoint scans. Kept as the cautionary
+// baseline.
+func BenchmarkPerRequestNaive(b *testing.B) {
 	keys, keyToPods, pods := benchFixture()
 	b.ReportAllocs()
 	for b.Loop() {
 		for _, p := range pods {
-			_ = oldMatchedBlockCount(keys, keyToPods, p)
-			_ = oldMatchedBlockCountByTier(keys, keyToPods, p)
+			_ = naiveMatchedBlockCount(keys, keyToPods, p)
+			_ = naiveMatchedBlockCountByTier(keys, keyToPods, p)
 		}
 	}
 }
 
+// BenchmarkPerRequestNew is the shipped single-pass implementation, which
+// covers every endpoint in one traversal.
 func BenchmarkPerRequestNew(b *testing.B) {
-	keys, keyToPods, pods := benchFixture()
+	keys, keyToPods, _ := benchFixture()
 	b.ReportAllocs()
 	for b.Loop() {
-		for _, p := range pods {
-			_ = matchedBlockCount(keys, keyToPods, p)
-			_ = matchedBlockCountByTier(keys, keyToPods, p)
-		}
+		_ = matchedPrefixCounts(keys, keyToPods)
 	}
 }

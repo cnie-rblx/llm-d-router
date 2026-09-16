@@ -401,6 +401,26 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		lookups = append(lookups, promptLookup{keys: blockKeys, keyToPods: keyToPods})
 	}
 
+	// One pass per lookup covering every endpoint, rather than one pass per
+	// endpoint per lookup. See matchedPrefixCounts: the per-endpoint form is
+	// O(endpoints x keys x entries) and was only affordable while it exited on
+	// the first block.
+	cachedBlocks := make(map[string]int, len(endpoints))
+	cachedBlocksByTier := make(map[string]map[string]int, len(endpoints))
+	for _, lu := range lookups {
+		for addr, c := range matchedPrefixCounts(lu.keys, lu.keyToPods) {
+			cachedBlocks[addr] += c.blocks
+			byTier := cachedBlocksByTier[addr]
+			if byTier == nil {
+				byTier = make(map[string]int, len(c.byTier))
+				cachedBlocksByTier[addr] = byTier
+			}
+			for tier, count := range c.byTier {
+				byTier[tier] += count
+			}
+		}
+	}
+
 	maxMatch := 0
 	for _, ep := range endpoints {
 		md := ep.GetMetadata()
@@ -412,19 +432,15 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		if matchLen > maxMatch {
 			maxMatch = matchLen
 		}
-		cachedBlocks := 0
-		cachedBlocksByTier := map[string]int{}
-		for _, lu := range lookups {
-			cachedBlocks += matchedBlockCount(lu.keys, lu.keyToPods, addr)
-			for tier, count := range matchedBlockCountByTier(lu.keys, lu.keyToPods, addr) {
-				cachedBlocksByTier[tier] += count
-			}
+		blocksByTier := cachedBlocksByTier[addr]
+		if blocksByTier == nil {
+			blocksByTier = map[string]int{} // WithCachedBlocksByTier expects non-nil
 		}
 		info := attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, p.blockSizeTokens).
-			WithCachedBlockCount(cachedBlocks).
-			WithCachedBlocksByTier(cachedBlocksByTier)
+			WithCachedBlockCount(cachedBlocks[addr]).
+			WithCachedBlocksByTier(blocksByTier)
 		if len(mmBlockIndices) > 0 {
-			info.WithMM(attrprefix.MMMatchInfo{MatchBlocks: countMMMatchedBlocks(mmBlockIndices, cachedBlocks)})
+			info.WithMM(attrprefix.MMMatchInfo{MatchBlocks: countMMMatchedBlocks(mmBlockIndices, cachedBlocks[addr])})
 		}
 		ep.Put(p.dk.String(), info)
 	}

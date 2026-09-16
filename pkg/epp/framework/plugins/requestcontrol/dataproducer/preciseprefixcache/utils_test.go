@@ -106,7 +106,12 @@ func TestMatchedBlockCount(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, matchedBlockCount(keys, tt.keyToPods, tt.podID))
+			got := matchedPrefixCounts(keys, tt.keyToPods)
+			blocks := 0
+			if c := got[tt.podID]; c != nil {
+				blocks = c.blocks
+			}
+			assert.Equal(t, tt.want, blocks)
 		})
 	}
 }
@@ -196,11 +201,15 @@ func TestMatchedBlockCountByTier(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := matchedBlockCountByTier(keys, tt.keyToPods, tt.podID)
-			assert.NotNil(t, got)
+			all := matchedPrefixCounts(keys, tt.keyToPods)
+			got := map[string]int{}
+			anyTier := 0
+			if c := all[tt.podID]; c != nil {
+				got = c.byTier
+				anyTier = c.blocks
+			}
 			assert.Equal(t, tt.want, got)
 			// Each tier's contiguous count never exceeds the any-tier count.
-			anyTier := matchedBlockCount(keys, tt.keyToPods, tt.podID)
 			for tier, count := range got {
 				assert.LessOrEqual(t, count, anyTier, "tier %q", tier)
 			}
