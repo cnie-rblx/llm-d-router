@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -83,9 +84,11 @@ type disaggDecidersParameters struct {
 
 // DisaggProfileHandlerParameters is the current parameter format using nested maps.
 type DisaggProfileHandlerParameters struct {
-	StageOrder StageOrder               `json:"stageOrder,omitempty"`
-	Profiles   disaggProfilesParameters `json:"profiles"`
-	Deciders   disaggDecidersParameters `json:"deciders"`
+	StageOrder                  StageOrder               `json:"stageOrder,omitempty"`
+	Profiles                    disaggProfilesParameters `json:"profiles"`
+	Deciders                    disaggDecidersParameters `json:"deciders"`
+	PrimaryPort                 int                      `json:"primaryPort,omitempty"`
+	PrefixMatchInfoProducerName string                   `json:"prefixMatchInfoProducerName,omitempty"`
 }
 
 // legacyDisaggProfileHandlerParameters is the deprecated flat parameter format.
@@ -155,6 +158,9 @@ func HandlerFactory(name string, rawParameters *json.Decoder, handle plugin.Hand
 		return nil, err
 	}
 	parameters := tmpParameters.(DisaggProfileHandlerParameters)
+	if parameters.PrimaryPort < 0 || parameters.PrimaryPort > 65535 {
+		return nil, fmt.Errorf("invalid primaryPort: must be between 1 and 65535, got %d", parameters.PrimaryPort)
+	}
 
 	// Resolve PD decider (optional).
 	var pdDecider deciderPlugin
@@ -190,7 +196,9 @@ func HandlerFactory(name string, rawParameters *json.Decoder, handle plugin.Hand
 	handler := NewDisaggProfileHandler(
 		parameters.Profiles.Decode, parameters.Profiles.Prefill, parameters.Profiles.Encode,
 		pdDecider, encodeDecider,
-	).WithStageOrder(parameters.StageOrder)
+	).WithStageOrder(parameters.StageOrder).
+		WithPrimaryPort(parameters.PrimaryPort).
+		WithPrefixMatchInfoProducerName(parameters.PrefixMatchInfoProducerName)
 	return handler.WithName(name), nil
 }
 
@@ -292,6 +300,8 @@ type Handler struct {
 	encodeProfile  string
 	pdDecider      deciderPlugin
 	encodeDecider  deciderPlugin
+	primaryPort    string
+	prefixDataKey  plugin.DataKey
 }
 
 // TypedName returns the typed name of the plugin.
@@ -309,12 +319,28 @@ func (h *Handler) WithStageOrder(stageOrder StageOrder) *Handler {
 	return h
 }
 
+// WithPrimaryPort configures the pod's externally reachable sidecar port.
+// The selected virtual rank remains in x-data-parallel-host-port.
+func (h *Handler) WithPrimaryPort(primaryPort int) *Handler {
+	if primaryPort != 0 {
+		h.primaryPort = strconv.Itoa(primaryPort)
+	}
+	return h
+}
+
+// WithPrefixMatchInfoProducerName selects the prefix-cache producer used by
+// the disaggregation decider.
+func (h *Handler) WithPrefixMatchInfoProducerName(name string) *Handler {
+	h.prefixDataKey = attrprefix.PrefixCacheMatchInfoDataKey.WithNonEmptyProducerName(name)
+	return h
+}
+
 // Consumes defines data types consumed by this plugin (through the PD decider).
-func (*Handler) Consumes() plugin.DataDependencies {
+func (h *Handler) Consumes() plugin.DataDependencies {
 	return plugin.DataDependencies{
 		Required: map[plugin.DataKey]any{
-			attrprefix.PrefixCacheMatchInfoDataKey: attrprefix.PrefixCacheMatchInfo{},
-			tokenproducer.TokenizedPromptDataKey:   scheduling.TokenizedPrompt{},
+			h.prefixDataKey:                      attrprefix.PrefixCacheMatchInfo{},
+			tokenproducer.TokenizedPromptDataKey: scheduling.TokenizedPrompt{},
 		},
 	}
 }
@@ -328,6 +354,7 @@ func newDisaggProfileHandler(handlerType, decodeProfile, prefillProfile, encodeP
 		encodeProfile:  encodeProfile,
 		pdDecider:      pdDecider,
 		encodeDecider:  encodeDecider,
+		prefixDataKey:  attrprefix.PrefixCacheMatchInfoDataKey,
 	}
 }
 
@@ -503,7 +530,24 @@ func (h *Handler) ProcessResults(
 
 	updatedResults := map[string]*scheduling.ProfileRunResult{}
 
-	updatedResults[h.decodeProfile] = decodeRunResults
+	if h.primaryPort == "" {
+		updatedResults[h.decodeProfile] = decodeRunResults
+	} else {
+		selected := decodeRunResults.TargetEndpoints[0].GetMetadata()
+		if request.Headers == nil {
+			request.Headers = map[string]string{}
+		}
+		request.Headers[routing.DataParallelEndpointHeader] = net.JoinHostPort(selected.Address, selected.Port)
+
+		updatedDecodeResults := &scheduling.ProfileRunResult{}
+		for _, target := range decodeRunResults.TargetEndpoints {
+			metadata := target.GetMetadata().Clone()
+			metadata.Port = h.primaryPort
+			updatedDecodeResults.TargetEndpoints = append(updatedDecodeResults.TargetEndpoints,
+				scheduling.NewEndpoint(metadata, target.GetMetrics(), target.Clone()))
+		}
+		updatedResults[h.decodeProfile] = updatedDecodeResults
+	}
 
 	if prefillRes, ok := profileResults[h.prefillProfile]; ok && prefillRes != nil {
 		updatedResults[h.prefillProfile] = prefillRes

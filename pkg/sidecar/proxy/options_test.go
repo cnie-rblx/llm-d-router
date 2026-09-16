@@ -91,6 +91,7 @@ func TestSidecarConfiguration(t *testing.T) {
 		port: 8011,
 		model-server-port: 8021,
 		data-parallel-size: 3,
+		data-parallel-mode: internal-lb,
 		kv-connector: %s,
 		ec-connector: %s,
 		enable-ssrf-protection: true,
@@ -132,6 +133,7 @@ func TestSidecarConfiguration(t *testing.T) {
 				o.Port = "8011"
 				o.modelServerPort = "8021"
 				o.DataParallelSize = 3
+				o.DataParallelMode = DataParallelModeInternalLB
 				o.MaxIdleConnsPerHost = 200
 				o.MooncakeBootstrapPort = 9001
 
@@ -225,6 +227,7 @@ func TestSidecarConfiguration(t *testing.T) {
 				port:                    "8111",
 				modelServerPort:         "8222",
 				dataParallelSize:        2,
+				dataParallelMode:        DataParallelModeExternalLB,
 				kvConnector:             KVConnectorNIXLV2,
 				ecConnector:             ECExampleConnector,
 				enableSSRFProtection:    true,
@@ -456,6 +459,7 @@ func compareOptions(t *testing.T, expected, actual *Options) {
 	assertEqual(port, expected.Port, actual.Port)
 	assertEqual(modelServerPort, expected.modelServerPort, actual.modelServerPort)
 	assertEqual(dataParallelSize, expected.DataParallelSize, actual.DataParallelSize)
+	assertEqual(dataParallelMode, expected.DataParallelMode, actual.DataParallelMode)
 	assertEqual(maxIdleConnsPerHost, expected.MaxIdleConnsPerHost, actual.MaxIdleConnsPerHost)
 
 	assertEqual(kvConnector, expected.KVConnector, actual.KVConnector)

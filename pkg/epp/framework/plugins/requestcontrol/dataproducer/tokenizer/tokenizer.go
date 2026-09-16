@@ -83,9 +83,10 @@ var TokenizedPromptDataKey = plugin.NewDataKey(tokenizedPromptKeyID, PluginType)
 // tokenizerPluginConfig holds the configuration for the tokenizer plugin.
 //
 // Backend selection: `vllm` or `modelName` selects the vLLM HTTP /render
-// backend; `udsTokenizerConfig` selects the deprecated gRPC-over-UDS backend;
-// `estimate` selects the tokenizer-free byte-packing backend, which is also the
-// zero-config default when no backend is set.
+// backend; `sglang` selects the SGLang HTTP /tokenize backend;
+// `udsTokenizerConfig` selects the deprecated gRPC-over-UDS backend; `estimate`
+// selects the tokenizer-free byte-packing backend, which is also the zero-config
+// default when no backend is set.
 type tokenizerPluginConfig struct {
 	// TokenizerConfig configures the deprecated gRPC-over-UDS backend.
 	//
@@ -94,6 +95,8 @@ type tokenizerPluginConfig struct {
 	TokenizerConfig kvctok.UdsTokenizerConfig `json:"udsTokenizerConfig,omitempty"`
 	// VLLM configures the vLLM /render backend.
 	VLLM *vllmConfig `json:"vllm,omitempty"`
+	// SGLang configures the SGLang /tokenize backend.
+	SGLang *sglangConfig `json:"sglang,omitempty"`
 	// Estimate selects the tokenizer-free byte-packing backend; mutually
 	// exclusive with 'vllm'/'udsTokenizerConfig' and needs no 'modelName'.
 	Estimate *estimateConfig `json:"estimate,omitempty"`
@@ -231,9 +234,16 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 
 	estimate := config.Estimate != nil
 	uds := config.TokenizerConfig.IsEnabled()
-	vllm := config.VLLM != nil || config.ModelName != ""
-	if (estimate && (uds || vllm)) || (uds && vllm) {
-		return nil, fmt.Errorf("invalid configuration for '%s' plugin: only one of 'estimate', 'vllm', or 'udsTokenizerConfig' may be set", PluginType)
+	sglang := config.SGLang != nil
+	vllm := config.VLLM != nil || (config.ModelName != "" && !sglang)
+	backendCount := 0
+	for _, configured := range []bool{estimate, uds, vllm, sglang} {
+		if configured {
+			backendCount++
+		}
+	}
+	if backendCount > 1 {
+		return nil, fmt.Errorf("invalid configuration for '%s' plugin: only one of 'estimate', 'vllm', 'sglang', or 'udsTokenizerConfig' may be set", PluginType)
 	}
 	// modelName is required only by the real-tokenizer backends; the zero-config
 	// path selects the estimate backend, which needs none.
@@ -281,8 +291,8 @@ func LegacyPluginFactory(name string, rawParameters *json.Decoder, handle plugin
 }
 
 // NewPlugin constructs the configured backend: udsTokenizerConfig (deprecated),
-// vllm /render (selected by 'vllm' or 'modelName'), or estimate byte-packing
-// (the default when no backend is set).
+// vllm /render (selected by 'vllm' or 'modelName'), SGLang /tokenize, or
+// estimate byte-packing (the default when no backend is set).
 func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) (*Plugin, error) {
 	var backend tokenInputProducer
 	switch {
@@ -296,6 +306,12 @@ func NewPlugin(ctx context.Context, name string, config *tokenizerPluginConfig) 
 			return nil, fmt.Errorf("failed to initialize UDS tokenizer for '%s' plugin - %w", PluginType, err)
 		}
 		backend = renderBackend{tk: uds}
+	case config.SGLang != nil:
+		renderer, err := newSGLangHTTPRenderer(config.SGLang)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize SGLang HTTP renderer for '%s' plugin - %w", PluginType, err)
+		}
+		backend = renderBackend{tk: renderer}
 	case config.VLLM != nil || config.ModelName != "":
 		cfg := config.VLLM
 		if cfg == nil {

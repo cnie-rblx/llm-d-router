@@ -59,6 +59,7 @@ const (
 	modelServerPort           = "model-server-port"
 	vllmPort                  = "vllm-port"
 	dataParallelSize          = "data-parallel-size"
+	dataParallelMode          = "data-parallel-mode"
 	kvConnector               = "kv-connector"
 	ecConnector               = "ec-connector"
 	mooncakeBootstrapPortFlag = "mooncake-bootstrap-port"
@@ -91,6 +92,7 @@ const (
 	defaultPort                  = "8000"
 	defaultVLLMPort              = "8200"
 	defaultDataParallelSize      = 1
+	defaultDataParallelMode      = DataParallelModeExternalLB
 	defaultMooncakeBootstrapPort = 8998
 	defaultP2PConnectorPort      = 7777
 
@@ -115,6 +117,7 @@ type yamlConfiguration struct {
 	MooncakeBootstrapPort   int      `json:"mooncake-bootstrap-port,omitempty"`
 	P2PConnectorPort        int      `json:"p2p-connector-port,omitempty"`
 	DataParallelSize        int      `json:"data-parallel-size,omitempty"`
+	DataParallelMode        string   `json:"data-parallel-mode,omitempty"`
 	KVConnector             string   `json:"kv-connector,omitempty"`
 	ECConnector             string   `json:"ec-connector,omitempty"`
 	EnableSSRFProtection    *bool    `json:"enable-ssrf-protection,omitempty"`
@@ -215,6 +218,7 @@ func NewOptions() *Options {
 			Port:                    defaultPort,
 			KVConnector:             KVConnectorNIXLV2,
 			DataParallelSize:        defaultDataParallelSize,
+			DataParallelMode:        defaultDataParallelMode,
 			SecureServing:           true,
 			EnablePrefillerSampling: enablePrefillerSampling,
 			MaxIdleConnsPerHost:     defaultMaxIdleConnsPerHost,
@@ -265,6 +269,8 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&opts.vllmPort, vllmPort, opts.vllmPort, "the port the model server is listening on")
 	_ = fs.MarkDeprecated(vllmPort, "use --model-server-port instead; --vllm-port will be removed after the deprecation period")
 	fs.IntVar(&opts.DataParallelSize, dataParallelSize, opts.DataParallelSize, "the model server's data-parallel size")
+	fs.StringVar(&opts.DataParallelMode, dataParallelMode, opts.DataParallelMode,
+		"data-parallel routing mode: external-lb uses one model-server port per rank; internal-lb pins all ranks on one model-server port")
 	fs.StringVar(&opts.KVConnector, kvConnector, opts.KVConnector,
 		"the KV protocol between prefiller and decoder. Supported: "+supportedKVConnectorNamesStr)
 	fs.StringVar(&opts.ECConnector, ecConnector, opts.ECConnector,
@@ -577,6 +583,9 @@ func (opts *Options) Validate() error {
 	if opts.DataParallelSize < 1 {
 		return fmt.Errorf("--data-parallel-size must be a positive integer, got %d", opts.DataParallelSize)
 	}
+	if opts.DataParallelMode != DataParallelModeExternalLB && opts.DataParallelMode != DataParallelModeInternalLB {
+		return fmt.Errorf("--data-parallel-mode must be one of: %s, %s", DataParallelModeExternalLB, DataParallelModeInternalLB)
+	}
 
 	port, err := strconv.Atoi(opts.Port)
 	if err != nil {
@@ -783,6 +792,9 @@ func (opts *Options) mergeYAMLConfiguration(cfg yamlConfiguration) {
 	}
 	if cfg.DataParallelSize != 0 && !opts.isFlagSet(dataParallelSize) {
 		opts.DataParallelSize = cfg.DataParallelSize
+	}
+	if cfg.DataParallelMode != "" && !opts.isFlagSet(dataParallelMode) {
+		opts.DataParallelMode = cfg.DataParallelMode
 	}
 	if cfg.MaxIdleConnsPerHost != 0 && !opts.isFlagSet(maxIdleConnsPerHost) {
 		opts.MaxIdleConnsPerHost = cfg.MaxIdleConnsPerHost

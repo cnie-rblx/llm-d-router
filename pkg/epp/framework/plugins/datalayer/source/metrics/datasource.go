@@ -116,5 +116,12 @@ func defaultDataSourceConfigParams() *metricsDatasourceParams {
 
 func parseMetrics(data io.Reader) (PrometheusMetricMap, error) {
 	parser := expfmt.NewTextParser(model.LegacyValidation)
-	return parser.TextToMetricFamilies(data)
+	families, err := parser.TextToMetricFamilies(data)
+	if err != nil && len(families) > 0 {
+		// Prometheus' parser returns metric families decoded before the malformed
+		// family. Preserve those so one unrelated bad metric does not prevent
+		// queue, running-request, and KV-utilization gauges from refreshing.
+		return families, nil
+	}
+	return families, err
 }
