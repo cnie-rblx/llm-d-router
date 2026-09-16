@@ -563,14 +563,50 @@ func TestZMQSubscriber_ProactiveReplayAcceptsEndAfterProgress(t *testing.T) {
 	require.Len(t, hits[key], 1, "terminal marker after replay progress must preserve the rebuilt index")
 }
 
-func TestZMQSubscriber_ProactiveReplayRejectsTruncatedHistory(t *testing.T) {
+// A cold join requests sequence 0, but a real engine's replay buffer is bounded
+// and answers from its oldest retained sequence. Rejecting that leaves the index
+// permanently empty, which is strictly worse than indexing the history that is
+// still available: a block whose store and eviction both predate the anchor is
+// unknown either way, so the anchored index under-reports cache hits but never
+// claims a block is resident when it is not.
+func TestZMQSubscriber_ProactiveReplayAnchorsOnOldestRetainedSequence(t *testing.T) {
 	h := newReplayHarness(t, []replayMessage{
-		{seq: 1, payload: buildDistinctBlockStoredPayload(t, 200)},
+		{seq: 28932, payload: buildDistinctBlockStoredPayload(t, 200)},
+		{seq: 28933, payload: buildDistinctBlockStoredPayload(t, 201)},
 	}, false)
 
-	time.Sleep(300 * time.Millisecond)
-	_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(200))
-	require.Error(t, err, "replay starting after the requested sequence must not populate the index")
+	require.Eventually(t, func() bool {
+		key, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(201))
+		if err != nil {
+			return false
+		}
+		hits, err := h.index.Lookup(h.ctx, []kvblock.BlockHash{key}, nil)
+		return err == nil && len(hits[key]) == 1
+	}, 5*time.Second, 50*time.Millisecond,
+		"a bounded replay buffer must still rebuild the index from its oldest retained sequence")
+}
+
+// The anchor applies only to the first event. A hole after it can hide the
+// eviction of a block already recorded, which would make the index claim a
+// block is resident when it is not, so it must still invalidate the replay.
+func TestZMQSubscriber_ProactiveReplayRejectsHoleAfterAnchor(t *testing.T) {
+	h := newReplayHarness(t, []replayMessage{
+		{seq: 28932, payload: buildDistinctBlockStoredPayload(t, 200)},
+		{seq: 28940, payload: buildDistinctBlockStoredPayload(t, 300)},
+	}, false)
+
+	require.Eventually(t, func() bool {
+		key, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(200))
+		if err != nil {
+			return false
+		}
+		hits, err := h.index.Lookup(h.ctx, []kvblock.BlockHash{key}, nil)
+		return err == nil && len(hits[key]) == 0
+	}, 5*time.Second, 50*time.Millisecond,
+		"a gap after the anchor must clear the partially rebuilt index")
+
+	_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(300))
+	require.Error(t, err, "events after the hole must not be indexed")
 }
 
 func TestZMQSubscriber_ProactiveReplayClearsPartialHistoryOnGap(t *testing.T) {

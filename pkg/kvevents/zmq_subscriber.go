@@ -384,8 +384,27 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 				break
 			}
 			if seq != expectedSeq {
-				terminalErr = fmt.Errorf("incomplete replay: expected sequence %d, got %d", expectedSeq, seq)
-				break
+				// A cold join (startSeq == 0) asks for the whole history, but an
+				// engine's replay buffer is bounded and answers from its oldest
+				// retained sequence. Demanding an exact match rejects every
+				// bounded buffer and leaves the index permanently empty, so
+				// anchor on whatever the engine can still offer.
+				//
+				// Skipping a contiguous prefix of history is safe: a block whose
+				// store and eviction both predate the anchor is simply unknown,
+				// which is self-consistent. A hole in the middle is not, because
+				// it can hide the eviction of a block we already recorded, so
+				// contiguity is still enforced after the anchor and for gap
+				// replays, where startSeq > 0.
+				if startSeq == 0 && replayed == 0 && seq > expectedSeq {
+					logger.Info("Anchoring cold-start replay at the engine's oldest retained sequence",
+						"requestedSeq", startSeq, "anchorSeq", seq,
+						"replayEndpoint", z.replayEndpoint)
+					expectedSeq = seq
+				} else {
+					terminalErr = fmt.Errorf("incomplete replay: expected sequence %d, got %d", expectedSeq, seq)
+					break
+				}
 			}
 
 			z.addTask(topic, seq, payload)
