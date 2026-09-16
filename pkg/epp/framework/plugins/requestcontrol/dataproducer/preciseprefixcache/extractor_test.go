@@ -25,6 +25,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/kvevents"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/labels"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -313,4 +314,74 @@ func TestProducer_ExtractEndpoint_DeleteWithMissingAddressRemovesExistingSubscri
 
 	ids, _ = p.subscribersManager.GetActiveSubscribers()
 	assert.Empty(t, ids)
+}
+
+// In a disaggregated deployment only prefill engines publish KV events, so the
+// producer must not dial the decode endpoints it also sees on the notification
+// source. Without a scope it retries those nonexistent sockets forever.
+func TestProducer_EnsureSubscriber_SkipsEndpointsOutsideLabelSelector(t *testing.T) {
+	cfg := kvevents.DefaultConfig()
+	cfg.PodDiscoveryConfig = kvevents.DefaultPodReconcilerConfig()
+	cfg.PodDiscoveryConfig.SocketPort = 5557
+
+	subscribers := &fakeSubscriberManager{}
+	selector, err := labels.Parse("llm-d.ai/role=prefill")
+	require.NoError(t, err)
+	p := &Producer{
+		typedName:          plugin.TypedName{Type: PluginType, Name: PluginType},
+		subscribersManager: subscribers,
+		kvEventsConfig:     cfg,
+		subscriberCtx:      context.Background(),
+		subscriberSelector: selector,
+	}
+
+	require.NoError(t, p.ensureSubscriber(context.Background(), &fwkdl.EndpointMetadata{
+		ID:        k8stypes.NamespacedName{Namespace: "ns", Name: "decode-rank-0"},
+		Address:   "10.0.0.2",
+		Port:      "8000",
+		RankIndex: 0,
+		Labels:    map[string]string{"llm-d.ai/role": "decode"},
+	}))
+	assert.Empty(t, subscribers.ids, "decode endpoints publish no KV events and must be skipped")
+
+	require.NoError(t, p.ensureSubscriber(context.Background(), &fwkdl.EndpointMetadata{
+		ID:        k8stypes.NamespacedName{Namespace: "ns", Name: "prefill-rank-0"},
+		Address:   "10.0.0.1",
+		Port:      "8000",
+		RankIndex: 0,
+		Labels:    map[string]string{"llm-d.ai/role": "prefill"},
+	}))
+	assert.Equal(t, []string{"ns/prefill-rank-0"}, subscribers.ids)
+}
+
+// An unset selector must preserve the previous behaviour of subscribing to
+// every endpoint, labels or not.
+func TestProducer_EnsureSubscriber_NoSelectorSubscribesToEveryEndpoint(t *testing.T) {
+	cfg := kvevents.DefaultConfig()
+	cfg.PodDiscoveryConfig = kvevents.DefaultPodReconcilerConfig()
+	cfg.PodDiscoveryConfig.SocketPort = 5557
+
+	subscribers := &fakeSubscriberManager{}
+	p := &Producer{
+		typedName:          plugin.TypedName{Type: PluginType, Name: PluginType},
+		subscribersManager: subscribers,
+		kvEventsConfig:     cfg,
+		subscriberCtx:      context.Background(),
+	}
+
+	require.NoError(t, p.ensureSubscriber(context.Background(), &fwkdl.EndpointMetadata{
+		ID:      k8stypes.NamespacedName{Namespace: "ns", Name: "decode-rank-0"},
+		Address: "10.0.0.2",
+		Port:    "8000",
+		Labels:  map[string]string{"llm-d.ai/role": "decode"},
+	}))
+	assert.Equal(t, []string{"ns/decode-rank-0"}, subscribers.ids)
+}
+
+func TestNew_RejectsInvalidSubscriberLabelSelector(t *testing.T) {
+	_, err := New(context.Background(), PluginType, PluginConfig{
+		SubscriberLabelSelector: "!!!not a selector",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "subscriberLabelSelector")
 }
