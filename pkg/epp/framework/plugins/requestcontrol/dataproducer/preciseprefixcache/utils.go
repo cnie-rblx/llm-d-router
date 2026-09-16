@@ -45,10 +45,19 @@ func extractEndpointSet(endpoints []scheduling.Endpoint) sets.Set[string] {
 // not hold. This is the unweighted counterpart of the device-tier-weighted
 // kvblock scorer: every cached block counts as one regardless of device tier,
 // so a pod present at keys[0..n-1] yields n.
+//
+// Blocks no pod is known to hold are skipped, not counted and not treated as
+// a miss, matching kvcache.LongestPrefixScorer: the index only learns a block
+// when an engine announces a new store, so permanently resident blocks are
+// absent for every pod and must not end the chain.
 func matchedBlockCount(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry, podID string) int {
 	count := 0
 	for _, key := range keys {
-		if !slices.ContainsFunc(keyToPods[key], func(e kvblock.PodEntry) bool { return e.PodIdentifier == podID }) {
+		entries := keyToPods[key]
+		if len(entries) == 0 {
+			continue // unknown to the index, not a miss
+		}
+		if !slices.ContainsFunc(entries, func(e kvblock.PodEntry) bool { return e.PodIdentifier == podID }) {
 			break
 		}
 		count++
@@ -64,13 +73,20 @@ func matchedBlockCount(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash
 // index, except speculative entries, which count under
 // attrprefix.SpeculativeTierKey: PreRequest inserts them before vLLM has
 // reported placement, so they carry no device tier.
+//
+// Blocks no pod is known to hold are skipped rather than ending the chain,
+// for the same reason as matchedBlockCount.
 // Returns a non-nil (possibly empty) map.
 func matchedBlockCountByTier(keys []kvblock.BlockHash, keyToPods map[kvblock.BlockHash][]kvblock.PodEntry, podID string) map[string]int {
 	counts := map[string]int{}
 	var alive sets.Set[string]
 	for _, key := range keys {
+		entries := keyToPods[key]
+		if len(entries) == 0 {
+			continue // unknown to the index, not a miss
+		}
 		tiersAtKey := sets.New[string]()
-		for _, e := range keyToPods[key] {
+		for _, e := range entries {
 			if e.PodIdentifier == podID {
 				if e.Speculative {
 					tiersAtKey.Insert(attrprefix.SpeculativeTierKey)

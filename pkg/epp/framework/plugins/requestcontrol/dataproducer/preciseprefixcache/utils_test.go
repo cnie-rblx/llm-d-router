@@ -59,15 +59,29 @@ func TestMatchedBlockCount(t *testing.T) {
 			want:  1,
 		},
 		{
-			name: "stops at first missing block",
+			// A block no pod holds is missing from the index, not missing from
+			// the engine: a block resident since before the index was built is
+			// never announced. Skipping it keeps the chain alive.
+			name: "block unknown to every pod is skipped, not counted as a miss",
 			keyToPods: map[kvblock.BlockHash][]kvblock.PodEntry{
-				1: {gpu(podA)}, 2: {gpu(podA)}, 4: {gpu(podA)}, // block 3 missing
+				1: {gpu(podA)}, 2: {gpu(podA)}, 4: {gpu(podA)}, // block 3 unknown
+			},
+			podID: podA,
+			want:  3,
+		},
+		{
+			// The regression that removed the routing signal entirely: the
+			// prompt head is the most likely region to be permanently
+			// resident, so it is unknown for every pod.
+			name: "unknown leading blocks do not zero the count",
+			keyToPods: map[kvblock.BlockHash][]kvblock.PodEntry{
+				3: {gpu(podA)}, 4: {gpu(podA)}, // blocks 1 and 2 unknown
 			},
 			podID: podA,
 			want:  2,
 		},
 		{
-			name: "pod absent from first block yields zero",
+			name: "pod absent from a block others hold yields zero",
 			keyToPods: map[kvblock.BlockHash][]kvblock.PodEntry{
 				1: {gpu(podB)}, 2: {gpu(podA)},
 			},
@@ -163,6 +177,14 @@ func TestMatchedBlockCountByTier(t *testing.T) {
 			},
 			podID: podA,
 			want:  map[string]int{"gpu": 1, attrprefix.SpeculativeTierKey: 2},
+		},
+		{
+			name: "unknown leading blocks do not zero the tier counts",
+			keyToPods: map[kvblock.BlockHash][]kvblock.PodEntry{
+				3: {gpu(podA), cpu(podA)}, 4: {gpu(podA)}, // blocks 1 and 2 unknown
+			},
+			podID: podA,
+			want:  map[string]int{"gpu": 2, "cpu": 1},
 		},
 		{
 			name:      "empty index yields empty map",

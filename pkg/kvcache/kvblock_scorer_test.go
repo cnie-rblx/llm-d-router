@@ -99,6 +99,83 @@ func TestLongestPrefixScorerDifferentTiers(t *testing.T) {
 	}
 }
 
+// Blocks absent from the index for every pod carry no information: engines
+// announce a block only when it is newly stored, so blocks resident since
+// before the index was built are never announced. They must not decide the
+// score, otherwise an unknown prompt head zeroes every pod and the routing
+// signal disappears.
+func TestLongestPrefixScorerSkipsUnknownLeadingBlocks(t *testing.T) {
+	scorer := &kvcache.LongestPrefixScorer{
+		MediumWeights: map[string]float64{"gpu": 1.0, "cpu": 0.5},
+	}
+	blockKeys := int64KeysToKVBlockKeys([]uint64{1001, 1002, 1003, 1004, 1005})
+
+	// 1001 and 1002 are held by nobody: the prompt head is resident on every
+	// engine and was never announced.
+	hitmap := map[kvblock.BlockHash][]kvblock.PodEntry{
+		1003: {{PodIdentifier: podA, DeviceTier: "gpu"}, {PodIdentifier: podB, DeviceTier: "gpu"}},
+		1004: {{PodIdentifier: podA, DeviceTier: "gpu"}},
+		1005: {{PodIdentifier: podA, DeviceTier: "gpu"}},
+	}
+
+	scored, err := scorer.Score(context.Background(), blockKeys, hitmap)
+	assert.NoError(t, err)
+	// Anchoring on keys[0] would have produced an empty map here.
+	assert.InDelta(t, 3.0, scored[podA], 0.0001)
+	assert.InDelta(t, 1.0, scored[podB], 0.0001)
+}
+
+// A hole in the middle of the prompt must not truncate the chain either.
+func TestLongestPrefixScorerSkipsUnknownInteriorBlocks(t *testing.T) {
+	scorer := &kvcache.LongestPrefixScorer{
+		MediumWeights: map[string]float64{"gpu": 1.0},
+	}
+	blockKeys := int64KeysToKVBlockKeys([]uint64{2001, 2002, 2003, 2004})
+
+	hitmap := map[kvblock.BlockHash][]kvblock.PodEntry{
+		2001: {{PodIdentifier: podA, DeviceTier: "gpu"}},
+		// 2002 unknown to the index.
+		2003: {{PodIdentifier: podA, DeviceTier: "gpu"}},
+		2004: {{PodIdentifier: podA, DeviceTier: "gpu"}},
+	}
+
+	scored, err := scorer.Score(context.Background(), blockKeys, hitmap)
+	assert.NoError(t, err)
+	assert.InDelta(t, 3.0, scored[podA], 0.0001)
+}
+
+// Discrimination between pods must be preserved: a block that some pods hold
+// and this one does not is a real miss, not missing information.
+func TestLongestPrefixScorerRealMissStillEndsChain(t *testing.T) {
+	scorer := &kvcache.LongestPrefixScorer{
+		MediumWeights: map[string]float64{"gpu": 1.0},
+	}
+	blockKeys := int64KeysToKVBlockKeys([]uint64{3001, 3002, 3003})
+
+	hitmap := map[kvblock.BlockHash][]kvblock.PodEntry{
+		3001: {{PodIdentifier: podA, DeviceTier: "gpu"}, {PodIdentifier: podB, DeviceTier: "gpu"}},
+		3002: {{PodIdentifier: podA, DeviceTier: "gpu"}}, // podB genuinely misses here
+		3003: {{PodIdentifier: podA, DeviceTier: "gpu"}},
+	}
+
+	scored, err := scorer.Score(context.Background(), blockKeys, hitmap)
+	assert.NoError(t, err)
+	assert.InDelta(t, 3.0, scored[podA], 0.0001)
+	assert.InDelta(t, 1.0, scored[podB], 0.0001, "podB should stop at its real miss")
+}
+
+// With nothing known about any block there is no signal, and every pod ties.
+func TestLongestPrefixScorerAllBlocksUnknown(t *testing.T) {
+	scorer := &kvcache.LongestPrefixScorer{
+		MediumWeights: map[string]float64{"gpu": 1.0},
+	}
+	blockKeys := int64KeysToKVBlockKeys([]uint64{4001, 4002})
+
+	scored, err := scorer.Score(context.Background(), blockKeys, map[kvblock.BlockHash][]kvblock.PodEntry{})
+	assert.NoError(t, err)
+	assert.Empty(t, scored)
+}
+
 func int64KeysToKVBlockKeys(keys []uint64) []kvblock.BlockHash {
 	kvKeys := make([]kvblock.BlockHash, len(keys))
 	for i, key := range keys {
