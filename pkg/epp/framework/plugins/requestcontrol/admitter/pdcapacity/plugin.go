@@ -28,7 +28,6 @@ import (
 
 	errcommon "github.com/llm-d/llm-d-router/pkg/common/error"
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
-	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
@@ -226,6 +225,9 @@ func (a *Admitter) Consumes() fwkplugin.DataDependencies {
 		fwkplugin.NewDataKey(a.config.Decode.Transfer.AttributeKey, ""):                                        attrmetrics.ScalarMetricValue(0),
 		fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(a.config.Decode.Prealloc.AttributeKey), ""): attrmetrics.ScalarMetricUpdateTime{},
 		fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(a.config.Decode.Transfer.AttributeKey), ""): attrmetrics.ScalarMetricUpdateTime{},
+		fwkplugin.NewDataKey(attrmetrics.WaitingQueueUpdateTimeKey, ""):                                        attrmetrics.CoreMetricUpdateTime{},
+		fwkplugin.NewDataKey(attrmetrics.KVCacheUtilizationUpdateTimeKey, ""):                                  attrmetrics.CoreMetricUpdateTime{},
+		fwkplugin.NewDataKey(attrmetrics.KVCacheCapacityUpdateTimeKey, ""):                                     attrmetrics.CoreMetricUpdateTime{},
 	}
 	return fwkplugin.DataDependencies{
 		Required: required,
@@ -284,8 +286,11 @@ func (a *Admitter) Admit(ctx context.Context, request *fwksched.InferenceRequest
 
 func (a *Admitter) prefillFeasible(endpoint fwksched.Endpoint, now time.Time) (bool, string) {
 	metrics := endpoint.GetMetrics()
-	if ok, reason := a.metricsFresh(metrics, now); !ok {
-		return false, reason
+	if metrics == nil {
+		return false, "missing metrics"
+	}
+	if !a.coreMetricFresh(endpoint, attrmetrics.WaitingQueueUpdateTimeKey, now) {
+		return false, "missing or stale ordinary waiting queue metric"
 	}
 	if metrics.WaitingQueueSize >= a.config.Prefill.WaitingQueueThreshold {
 		return false, "ordinary waiting queue threshold reached"
@@ -319,11 +324,17 @@ func (a *Admitter) prefillFeasible(endpoint fwksched.Endpoint, now time.Time) (b
 
 func (a *Admitter) decodeFeasible(request *fwksched.InferenceRequest, endpoint fwksched.Endpoint, now time.Time) (bool, string) {
 	metrics := endpoint.GetMetrics()
-	if ok, reason := a.metricsFresh(metrics, now); !ok {
-		return false, reason
+	if metrics == nil {
+		return false, "missing metrics"
+	}
+	if !a.coreMetricFresh(endpoint, attrmetrics.WaitingQueueUpdateTimeKey, now) {
+		return false, "missing or stale ordinary waiting queue metric"
 	}
 	if metrics.WaitingQueueSize >= a.config.Decode.WaitingQueueThreshold {
 		return false, "ordinary waiting queue threshold reached"
+	}
+	if !a.coreMetricFresh(endpoint, attrmetrics.KVCacheUtilizationUpdateTimeKey, now) {
+		return false, "missing or stale KV utilization metric"
 	}
 	if metrics.KVCacheUsagePercent >= a.config.Decode.KVCacheUtilizationThreshold {
 		return false, "KV utilization threshold reached"
@@ -341,6 +352,9 @@ func (a *Admitter) decodeFeasible(request *fwksched.InferenceRequest, endpoint f
 	}
 	if float64(transfer) >= a.config.Decode.Transfer.Threshold {
 		return false, "decode transfer threshold reached"
+	}
+	if !a.coreMetricFresh(endpoint, attrmetrics.KVCacheCapacityUpdateTimeKey, now) {
+		return false, "missing or stale KV token capacity metric"
 	}
 	if metrics.KvCacheMaxTokenCapacity <= 0 {
 		return false, "missing KV token capacity"
@@ -367,17 +381,9 @@ func (a *Admitter) requiredKVTokens(request *fwksched.InferenceRequest) (int64, 
 	return int64(request.Body.TokenizedPrompt.TokenCount()) + outputTokens, true
 }
 
-func (a *Admitter) metricsFresh(metrics *fwkdl.Metrics, now time.Time) (bool, string) {
-	if metrics == nil {
-		return false, "missing metrics"
-	}
-	if metrics.UpdateTime.IsZero() {
-		return false, "missing metrics timestamp"
-	}
-	if now.Sub(metrics.UpdateTime) > a.metricsStalenessThreshold {
-		return false, "stale metrics"
-	}
-	return true, ""
+func (a *Admitter) coreMetricFresh(endpoint fwksched.Endpoint, key string, now time.Time) bool {
+	updatedAt, ok := attrmetrics.ReadCoreMetricUpdateTime(endpoint, key)
+	return ok && !updatedAt.IsZero() && now.Sub(updatedAt) <= a.metricsStalenessThreshold
 }
 
 func (a *Admitter) readFreshSignal(endpoint fwksched.Endpoint, key string, now time.Time) (attrmetrics.ScalarMetricValue, bool) {

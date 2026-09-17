@@ -101,12 +101,16 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 	current := ep.GetMetrics()
 	clone := current.Clone()
 	updated := false
+	observedAt := time.Now()
+	cacheBlockSizeUpdated := false
+	cacheNumBlocksUpdated := false
 
 	if spec := mapping.TotalQueuedRequests; spec != nil { // extract queued requests
 		if metric, err := spec.getLatestMetric(families); err != nil {
 			errs = append(errs, err)
 		} else {
 			clone.WaitingQueueSize = int(extractValue(metric))
+			ep.GetAttributes().Put(attrmetrics.WaitingQueueUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(observedAt))
 			updated = true
 		}
 	}
@@ -125,6 +129,7 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 			errs = append(errs, err)
 		} else {
 			clone.KVCacheUsagePercent = extractValue(metric)
+			ep.GetAttributes().Put(attrmetrics.KVCacheUtilizationUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(observedAt))
 			updated = true
 		}
 	}
@@ -149,7 +154,10 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 			if numBlocksLabel == "" {
 				numBlocksLabel = CacheConfigNumGPUBlocksMetricName
 			}
-			populateCacheInfoMetrics(clone, metric, blockSizeLabel, numBlocksLabel, &errs)
+			if populateCacheInfoMetrics(clone, metric, blockSizeLabel, numBlocksLabel, &errs) {
+				clone.KvCacheMaxTokenCapacity = clone.CacheBlockSize * clone.CacheNumBlocks
+				ep.GetAttributes().Put(attrmetrics.KVCacheCapacityUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(observedAt))
+			}
 			updated = true
 		}
 	}
@@ -159,6 +167,7 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 			errs = append(errs, err)
 		} else {
 			clone.CacheBlockSize = int(extractValue(metric))
+			cacheBlockSizeUpdated = true
 			updated = true
 		}
 	}
@@ -168,8 +177,13 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 			errs = append(errs, err)
 		} else {
 			clone.CacheNumBlocks = int(extractValue(metric))
+			cacheNumBlocksUpdated = true
 			updated = true
 		}
+	}
+	if cacheBlockSizeUpdated && cacheNumBlocksUpdated {
+		clone.KvCacheMaxTokenCapacity = clone.CacheBlockSize * clone.CacheNumBlocks
+		ep.GetAttributes().Put(attrmetrics.KVCacheCapacityUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(observedAt))
 	}
 
 	for _, custom := range mapping.CustomMetrics {
@@ -179,13 +193,13 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 			continue
 		}
 		ep.GetAttributes().Put(custom.AttributeKey, attrmetrics.ScalarMetricValue(extractValue(metric)))
-		ep.GetAttributes().Put(attrmetrics.ScalarMetricUpdateTimeKey(custom.AttributeKey), attrmetrics.ScalarMetricUpdateTime(time.Now()))
+		ep.GetAttributes().Put(attrmetrics.ScalarMetricUpdateTimeKey(custom.AttributeKey), attrmetrics.ScalarMetricUpdateTime(observedAt))
 		updated = true
 	}
 
 	logger := log.FromContext(ctx).WithValues("endpoint", ep.GetMetadata().ID)
 	if updated {
-		clone.UpdateTime = time.Now()
+		clone.UpdateTime = observedAt
 		logger.V(logutil.TRACE).Info("Refreshed metrics",
 			"metrics", mapping.MetricNames(),
 			"updated", clone,
@@ -243,14 +257,18 @@ func populateLoRAMetrics(clone *fwkdl.Metrics, metric *dto.Metric, errs *[]error
 // populateCacheInfoMetrics updates the metrics with cache info from the metric labels.
 // blockSizeLabelName and numBlocksLabelName allow engines to use different label names
 // (e.g. SGLang uses "page_size" and "num_pages" instead of "block_size" and "num_gpu_blocks").
-func populateCacheInfoMetrics(clone *fwkdl.Metrics, metric *dto.Metric, blockSizeLabelName, numBlocksLabelName string, errs *[]error) {
+func populateCacheInfoMetrics(clone *fwkdl.Metrics, metric *dto.Metric, blockSizeLabelName, numBlocksLabelName string, errs *[]error) bool {
 	clone.CacheBlockSize = 0
+	clone.CacheNumBlocks = 0
+	blockSizeFound := false
+	numBlocksFound := false
 	for _, label := range metric.GetLabel() {
 		switch label.GetName() {
 		case blockSizeLabelName:
 			if label.GetValue() != "" {
 				if val, err := strconv.Atoi(label.GetValue()); err == nil {
 					clone.CacheBlockSize = val
+					blockSizeFound = true
 				} else {
 					*errs = append(*errs, err)
 				}
@@ -259,12 +277,14 @@ func populateCacheInfoMetrics(clone *fwkdl.Metrics, metric *dto.Metric, blockSiz
 			if label.GetValue() != "" {
 				if val, err := strconv.Atoi(label.GetValue()); err == nil {
 					clone.CacheNumBlocks = val
+					numBlocksFound = true
 				} else {
 					*errs = append(*errs, err)
 				}
 			}
 		}
 	}
+	return blockSizeFound && numBlocksFound
 }
 
 // addAdapters splits a comma-separated adapter list and stores keys with default value 0.

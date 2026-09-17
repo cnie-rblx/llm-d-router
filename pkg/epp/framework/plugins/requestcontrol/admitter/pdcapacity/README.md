@@ -28,8 +28,10 @@ A decode endpoint must have:
   reservation.
 
 The plugin is stateless and evaluates each metrics snapshot independently.
-Missing metrics, missing custom attributes, zero timestamps, and stale metrics
-make only the affected endpoint unavailable.
+The core metrics extractor timestamps each required signal independently and
+derives KV-token capacity as `cacheBlockSize * cacheNumBlocks`. Missing metrics,
+missing custom attributes, zero timestamps, and stale metrics make only the
+affected endpoint unavailable.
 
 ## Configuration
 

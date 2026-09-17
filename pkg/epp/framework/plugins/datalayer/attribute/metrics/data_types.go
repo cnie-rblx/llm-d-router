@@ -22,7 +22,15 @@ import (
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 )
 
-const scalarMetricUpdateTimeSuffix = ".updateTime"
+const (
+	scalarMetricUpdateTimeSuffix = ".updateTime"
+	// WaitingQueueUpdateTimeKey identifies the waiting-queue scrape timestamp.
+	WaitingQueueUpdateTimeKey = "core-metrics.waiting-queue.updateTime"
+	// KVCacheUtilizationUpdateTimeKey identifies the KV-utilization scrape timestamp.
+	KVCacheUtilizationUpdateTimeKey = "core-metrics.kv-cache-utilization.updateTime"
+	// KVCacheCapacityUpdateTimeKey identifies the KV-capacity scrape timestamp.
+	KVCacheCapacityUpdateTimeKey = "core-metrics.kv-cache-capacity.updateTime"
+)
 
 // ScalarMetricValue is a numeric endpoint attribute extracted from a configured scalar metric.
 type ScalarMetricValue float64
@@ -50,5 +58,18 @@ func ScalarMetricUpdateTimeKey(key string) string {
 // ReadScalarMetricUpdateTime reads the companion timestamp for a scalar metric.
 func ReadScalarMetricUpdateTime(attrs fwkdl.AttributeMap, key string) (time.Time, bool) {
 	value, ok := fwkdl.ReadAttribute[ScalarMetricUpdateTime](attrs, ScalarMetricUpdateTimeKey(key))
+	return time.Time(value), ok
+}
+
+// CoreMetricUpdateTime records when one core endpoint metric was extracted.
+type CoreMetricUpdateTime time.Time
+
+func (v CoreMetricUpdateTime) Clone() fwkdl.Cloneable {
+	return v
+}
+
+// ReadCoreMetricUpdateTime reads a core endpoint metric timestamp.
+func ReadCoreMetricUpdateTime(attrs fwkdl.AttributeMap, key string) (time.Time, bool) {
+	value, ok := fwkdl.ReadAttribute[CoreMetricUpdateTime](attrs, key)
 	return time.Time(value), ok
 }

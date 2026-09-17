@@ -164,6 +164,16 @@ func TestMetricsExtractionDefaultConfig(t *testing.T) {
 	assert.Contains(t, m.WaitingModels, "adapter-c")
 	assert.Equal(t, 16, m.CacheBlockSize, "CacheBlockSize")
 	assert.Equal(t, 512, m.CacheNumBlocks, "CacheNumBlocks")
+	assert.Equal(t, 8192, m.KvCacheMaxTokenCapacity, "KvCacheMaxTokenCapacity")
+	for _, key := range []string{
+		attrmetrics.WaitingQueueUpdateTimeKey,
+		attrmetrics.KVCacheUtilizationUpdateTimeKey,
+		attrmetrics.KVCacheCapacityUpdateTimeKey,
+	} {
+		updatedAt, ok := attrmetrics.ReadCoreMetricUpdateTime(ep.GetAttributes(), key)
+		require.True(t, ok, "%s should have an update timestamp", key)
+		assert.False(t, updatedAt.IsZero())
+	}
 }
 
 // TestMetricsExtractionLoRADisabledViaConfig verifies the "disable a specific metric"
@@ -436,6 +446,48 @@ func TestMetricsExtractionMissingCustomScalarKeepsItsPreviousUpdateTime(t *testi
 	require.True(t, ok)
 	assert.Equal(t, queueUpdatedAt, afterMissingScrape,
 		"a successful update of another metric must not refresh the missing metric")
+}
+
+func TestMetricsExtractionMissingCoreMetricKeepsItsPreviousUpdateTime(t *testing.T) {
+	ext := buildExtractor(t, &modelServerExtractorParams{
+		EngineConfigs: []engineConfigParams{
+			{
+				Name:                "vllm",
+				QueuedRequestsSpec:  "custom_queue_depth",
+				RunningRequestsSpec: "custom_running",
+			},
+		},
+	})
+	ep := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{
+		Labels: map[string]string{DefaultEngineTypeLabelKey: "vllm"},
+	}, fwkdl.NewMetrics())
+	input := func(payload sourcemetrics.PrometheusMetricMap) fwkdl.PollInput[sourcemetrics.PrometheusMetricMap] {
+		return fwkdl.PollInput[sourcemetrics.PrometheusMetricMap]{Endpoint: ep, Payload: payload}
+	}
+	gauge := func(value float64) *dto.MetricFamily {
+		return &dto.MetricFamily{
+			Type: dto.MetricType_GAUGE.Enum(),
+			Metric: []*dto.Metric{
+				{Gauge: &dto.Gauge{Value: ptr.To(value)}},
+			},
+		}
+	}
+
+	require.NoError(t, ext.Extract(context.Background(), input(sourcemetrics.PrometheusMetricMap{
+		"custom_queue_depth": gauge(2),
+		"custom_running":     gauge(1),
+	})))
+	queueUpdatedAt, ok := attrmetrics.ReadCoreMetricUpdateTime(ep.GetAttributes(), attrmetrics.WaitingQueueUpdateTimeKey)
+	require.True(t, ok)
+
+	err := ext.Extract(context.Background(), input(sourcemetrics.PrometheusMetricMap{
+		"custom_running": gauge(2),
+	}))
+	require.ErrorContains(t, err, "custom_queue_depth")
+	afterMissingScrape, ok := attrmetrics.ReadCoreMetricUpdateTime(ep.GetAttributes(), attrmetrics.WaitingQueueUpdateTimeKey)
+	require.True(t, ok)
+	assert.Equal(t, queueUpdatedAt, afterMissingScrape,
+		"a successful update of another core metric must not refresh the missing metric")
 }
 
 func TestMetricsExtractionCustomCounterFromConfig(t *testing.T) {

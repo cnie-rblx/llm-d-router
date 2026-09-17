@@ -84,6 +84,9 @@ func TestConsumesPredictedWaitDependencies(t *testing.T) {
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(transferKey, ""))
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(preallocKey), ""))
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(transferKey), ""))
+	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.WaitingQueueUpdateTimeKey, ""))
+	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.KVCacheUtilizationUpdateTimeKey, ""))
+	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.KVCacheCapacityUpdateTimeKey, ""))
 
 	config.Prefill.PredictedWait = &PredictedWaitConfig{
 		InFlightLoadProducerName: "custom-inflight",
@@ -325,6 +328,23 @@ func TestAdmitRejectsStaleCustomMetrics(t *testing.T) {
 	assert.Equal(t, errcommon.ResourceExhausted, typed.Code)
 }
 
+func TestAdmitRejectsStaleCoreMetricDespiteFreshSharedTimestamp(t *testing.T) {
+	admitter, err := New("test", DefaultConfig())
+	require.NoError(t, err)
+
+	prefill := endpoint("prefill", bylabel.RolePrefill, 0, 0.1, 100000, 0, 0, time.Now())
+	decode := endpoint("decode", bylabel.RoleDecode, 0, 0.1, 100000, 0, 0, time.Now())
+	decode.GetMetrics().UpdateTime = time.Now()
+	decode.Put(attrmetrics.WaitingQueueUpdateTimeKey,
+		attrmetrics.CoreMetricUpdateTime(time.Now().Add(-time.Minute)))
+
+	err = admitter.Admit(context.Background(), request(1000, 1000, 0), []fwksched.Endpoint{prefill, decode})
+	require.Error(t, err)
+	var typed errcommon.Error
+	require.ErrorAs(t, err, &typed)
+	assert.Equal(t, errcommon.ResourceExhausted, typed.Code)
+}
+
 func TestEndpointRoles(t *testing.T) {
 	tests := []struct {
 		role        string
@@ -366,6 +386,9 @@ func endpoint(name, role string, waiting int, kvUsage float64, kvCapacity int, p
 	attrs.Put(transferKey, attrmetrics.ScalarMetricValue(transfer))
 	attrs.Put(attrmetrics.ScalarMetricUpdateTimeKey(preallocKey), attrmetrics.ScalarMetricUpdateTime(updated))
 	attrs.Put(attrmetrics.ScalarMetricUpdateTimeKey(transferKey), attrmetrics.ScalarMetricUpdateTime(updated))
+	attrs.Put(attrmetrics.WaitingQueueUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
+	attrs.Put(attrmetrics.KVCacheUtilizationUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
+	attrs.Put(attrmetrics.KVCacheCapacityUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
 	labels := map[string]string{}
 	if role != "" {
 		labels[bylabel.RoleLabel] = role
@@ -383,10 +406,14 @@ func endpoint(name, role string, waiting int, kvUsage float64, kvCapacity int, p
 }
 
 func endpointWithoutCustomMetrics(name, role string, updated time.Time) fwksched.Endpoint {
+	attrs := fwkdl.NewAttributes()
+	attrs.Put(attrmetrics.WaitingQueueUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
+	attrs.Put(attrmetrics.KVCacheUtilizationUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
+	attrs.Put(attrmetrics.KVCacheCapacityUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
 	return fwksched.NewEndpoint(
 		&fwkdl.EndpointMetadata{Name: name, Labels: map[string]string{bylabel.RoleLabel: role}},
 		&fwkdl.Metrics{KvCacheMaxTokenCapacity: 100000, UpdateTime: updated},
-		fwkdl.NewAttributes(),
+		attrs,
 	)
 }
 
