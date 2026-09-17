@@ -325,6 +325,31 @@ func TestAdmitRejectsStaleCustomMetrics(t *testing.T) {
 	assert.Equal(t, errcommon.ResourceExhausted, typed.Code)
 }
 
+func TestEndpointRoles(t *testing.T) {
+	tests := []struct {
+		role        string
+		wantPrefill bool
+		wantDecode  bool
+	}{
+		{role: bylabel.RolePrefill, wantPrefill: true},
+		{role: bylabel.RoleDecode, wantDecode: true},
+		{role: bylabel.RoleEncodePrefill, wantPrefill: true},
+		{role: bylabel.RolePrefillDecode, wantPrefill: true, wantDecode: true},
+		{role: legacyRoleBoth, wantPrefill: true, wantDecode: true},
+		{role: bylabel.RoleEncodePrefillDecode, wantPrefill: true, wantDecode: true},
+		{role: ""},
+		{role: "unknown"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.role, func(t *testing.T) {
+			prefill, decode := endpointRoles(endpoint("test", tt.role, 0, 0, 100000, 0, 0, time.Now()))
+			assert.Equal(t, tt.wantPrefill, prefill)
+			assert.Equal(t, tt.wantDecode, decode)
+		})
+	}
+}
+
 func request(promptTokens int, maxOutputTokens int64, priority int) *fwksched.InferenceRequest {
 	return &fwksched.InferenceRequest{
 		Body: &fwkrh.InferenceRequestBody{

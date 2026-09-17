@@ -52,6 +52,7 @@ const (
 	defaultTransferAttributeKey      = "sglang.decode_transfer_queue_reqs"
 	defaultTransferThreshold         = 12.0
 	defaultPrefillWaitingThreshold   = 4
+	legacyRoleBoth                   = "both"
 )
 
 // SignalConfig identifies a scalar endpoint metric and its rejection threshold.
@@ -404,7 +405,7 @@ func endpointRoles(endpoint fwksched.Endpoint) (bool, bool) {
 		return true, false
 	case bylabel.RoleDecode:
 		return false, true
-	case bylabel.RolePrefillDecode, bylabel.RoleBoth, bylabel.RoleEncodePrefillDecode:
+	case bylabel.RolePrefillDecode, legacyRoleBoth, bylabel.RoleEncodePrefillDecode:
 		return true, true
 	case bylabel.RoleEncodePrefill:
 		return true, false
