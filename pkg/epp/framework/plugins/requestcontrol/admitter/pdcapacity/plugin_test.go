@@ -29,10 +29,12 @@ import (
 
 	errcommon "github.com/llm-d/llm-d-router/pkg/common/error"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 	attrmetrics "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/metrics"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
 )
 
@@ -77,8 +79,11 @@ func TestConsumesPredictedWaitDependencies(t *testing.T) {
 	without, err := New("test", config)
 	require.NoError(t, err)
 	deps := without.Consumes()
-	assert.NotEmpty(t, deps.Required)
-	assert.Len(t, deps.Optional, 2)
+	assert.Contains(t, deps.Required, tokenizer.TokenizedPromptDataKey)
+	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(preallocKey, ""))
+	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(transferKey, ""))
+	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(preallocKey), ""))
+	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(transferKey), ""))
 
 	config.Prefill.PredictedWait = &PredictedWaitConfig{
 		InFlightLoadProducerName: "custom-inflight",
@@ -88,7 +93,8 @@ func TestConsumesPredictedWaitDependencies(t *testing.T) {
 	with, err := New("test", config)
 	require.NoError(t, err)
 	deps = with.Consumes()
-	assert.Len(t, deps.Required, 3)
+	assert.Contains(t, deps.Required, with.inFlightLoadDataKey)
+	assert.Contains(t, deps.Required, with.uncachedRequestTokensDataKey)
 }
 
 func TestAdmit(t *testing.T) {
@@ -182,6 +188,14 @@ func TestAdmit(t *testing.T) {
 			wantCode: errcommon.ResourceExhausted,
 		},
 		{
+			name: "missing core metrics",
+			endpoints: []fwksched.Endpoint{
+				endpoint("prefill", bylabel.RolePrefill, 0, 0.1, 100000, 0, 0, time.Now()),
+				endpointWithoutCoreMetrics("decode", bylabel.RoleDecode),
+			},
+			wantCode: errcommon.ResourceExhausted,
+		},
+		{
 			name: "missing custom decode metric",
 			endpoints: []fwksched.Endpoint{
 				endpoint("prefill", bylabel.RolePrefill, 0, 0.1, 100000, 0, 0, time.Now()),
@@ -203,7 +217,7 @@ func TestAdmit(t *testing.T) {
 			wantCode: errcommon.ResourceExhausted,
 		},
 		{
-			name: "protected priority bypasses gate by default",
+			name: "configured priority bypass skips gate",
 			configure: func(config *Config) {
 				config.RejectAllPriorities = false
 			},
@@ -239,6 +253,38 @@ func TestAdmit(t *testing.T) {
 	}
 }
 
+func TestRequiredKVTokens(t *testing.T) {
+	admitter, err := New("test", DefaultConfig())
+	require.NoError(t, err)
+
+	tests := []struct {
+		name            string
+		request         *fwksched.InferenceRequest
+		want            int64
+		wantTokenizedOK bool
+	}{
+		{name: "requested output", request: request(1000, 1000, 0), want: 2000, wantTokenizedOK: true},
+		{name: "requested output is capped", request: request(1000, 9000, 0), want: 9192, wantTokenizedOK: true},
+		{
+			name: "missing output uses default",
+			request: &fwksched.InferenceRequest{Body: &fwkrh.InferenceRequestBody{
+				TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{make([]uint32, 1000)}},
+			}},
+			want:            3048,
+			wantTokenizedOK: true,
+		},
+		{name: "missing tokenized prompt", request: &fwksched.InferenceRequest{Body: &fwkrh.InferenceRequestBody{}}, wantTokenizedOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := admitter.requiredKVTokens(tt.request)
+			assert.Equal(t, tt.wantTokenizedOK, ok)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestAdmitPredictedPrefillWait(t *testing.T) {
 	config := DefaultConfig()
 	config.RejectAllPriorities = true
@@ -262,6 +308,23 @@ func TestAdmitPredictedPrefillWait(t *testing.T) {
 	assert.Equal(t, errcommon.ResourceExhausted, typed.Code)
 }
 
+func TestAdmitRejectsStaleCustomMetrics(t *testing.T) {
+	config := DefaultConfig()
+	admitter, err := New("test", config)
+	require.NoError(t, err)
+
+	prefill := endpoint("prefill", bylabel.RolePrefill, 0, 0.1, 100000, 0, 0, time.Now())
+	decode := endpoint("decode", bylabel.RoleDecode, 0, 0.1, 100000, 0, 0, time.Now())
+	decode.Put(attrmetrics.ScalarMetricUpdateTimeKey(preallocKey),
+		attrmetrics.ScalarMetricUpdateTime(time.Now().Add(-time.Minute)))
+
+	err = admitter.Admit(context.Background(), request(1000, 1000, 0), []fwksched.Endpoint{prefill, decode})
+	require.Error(t, err)
+	var typed errcommon.Error
+	require.ErrorAs(t, err, &typed)
+	assert.Equal(t, errcommon.ResourceExhausted, typed.Code)
+}
+
 func request(promptTokens int, maxOutputTokens int64, priority int) *fwksched.InferenceRequest {
 	return &fwksched.InferenceRequest{
 		Body: &fwkrh.InferenceRequestBody{
@@ -276,6 +339,8 @@ func endpoint(name, role string, waiting int, kvUsage float64, kvCapacity int, p
 	attrs := fwkdl.NewAttributes()
 	attrs.Put(preallocKey, attrmetrics.ScalarMetricValue(prealloc))
 	attrs.Put(transferKey, attrmetrics.ScalarMetricValue(transfer))
+	attrs.Put(attrmetrics.ScalarMetricUpdateTimeKey(preallocKey), attrmetrics.ScalarMetricUpdateTime(updated))
+	attrs.Put(attrmetrics.ScalarMetricUpdateTimeKey(transferKey), attrmetrics.ScalarMetricUpdateTime(updated))
 	labels := map[string]string{}
 	if role != "" {
 		labels[bylabel.RoleLabel] = role
@@ -300,8 +365,22 @@ func endpointWithoutCustomMetrics(name, role string, updated time.Time) fwksched
 	)
 }
 
+func endpointWithoutCoreMetrics(name, role string) fwksched.Endpoint {
+	attrs := fwkdl.NewAttributes()
+	attrs.Put(preallocKey, attrmetrics.ScalarMetricValue(0))
+	attrs.Put(transferKey, attrmetrics.ScalarMetricValue(0))
+	attrs.Put(attrmetrics.ScalarMetricUpdateTimeKey(preallocKey), attrmetrics.ScalarMetricUpdateTime(time.Now()))
+	attrs.Put(attrmetrics.ScalarMetricUpdateTimeKey(transferKey), attrmetrics.ScalarMetricUpdateTime(time.Now()))
+	return fwksched.NewEndpoint(
+		&fwkdl.EndpointMetadata{Name: name, Labels: map[string]string{bylabel.RoleLabel: role}},
+		nil,
+		attrs,
+	)
+}
+
 func TestDefaultConfigValues(t *testing.T) {
 	config := DefaultConfig()
+	assert.True(t, config.RejectAllPriorities)
 	assert.Equal(t, "12s", config.MetricsStalenessThreshold)
 	assert.Equal(t, 4, config.Decode.WaitingQueueThreshold)
 	assert.Equal(t, 0.92, config.Decode.KVCacheUtilizationThreshold)

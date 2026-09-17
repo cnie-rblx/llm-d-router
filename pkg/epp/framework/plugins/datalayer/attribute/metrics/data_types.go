@@ -16,7 +16,13 @@ limitations under the License.
 
 package metrics
 
-import fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+import (
+	"time"
+
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+)
+
+const scalarMetricUpdateTimeSuffix = ".updateTime"
 
 // ScalarMetricValue is a numeric endpoint attribute extracted from a configured scalar metric.
 type ScalarMetricValue float64
@@ -27,4 +33,22 @@ func (v ScalarMetricValue) Clone() fwkdl.Cloneable {
 
 func ReadScalarMetricValue(attrs fwkdl.AttributeMap, key string) (ScalarMetricValue, bool) {
 	return fwkdl.ReadAttribute[ScalarMetricValue](attrs, key)
+}
+
+// ScalarMetricUpdateTime records when a scalar endpoint metric was extracted.
+type ScalarMetricUpdateTime time.Time
+
+func (v ScalarMetricUpdateTime) Clone() fwkdl.Cloneable {
+	return v
+}
+
+// ScalarMetricUpdateTimeKey returns the companion timestamp key for a scalar metric.
+func ScalarMetricUpdateTimeKey(key string) string {
+	return key + scalarMetricUpdateTimeSuffix
+}
+
+// ReadScalarMetricUpdateTime reads the companion timestamp for a scalar metric.
+func ReadScalarMetricUpdateTime(attrs fwkdl.AttributeMap, key string) (time.Time, bool) {
+	value, ok := fwkdl.ReadAttribute[ScalarMetricUpdateTime](attrs, ScalarMetricUpdateTimeKey(key))
+	return time.Time(value), ok
 }

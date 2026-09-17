@@ -179,6 +179,7 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 			continue
 		}
 		ep.GetAttributes().Put(custom.AttributeKey, attrmetrics.ScalarMetricValue(extractValue(metric)))
+		ep.GetAttributes().Put(attrmetrics.ScalarMetricUpdateTimeKey(custom.AttributeKey), attrmetrics.ScalarMetricUpdateTime(time.Now()))
 		updated = true
 	}
 

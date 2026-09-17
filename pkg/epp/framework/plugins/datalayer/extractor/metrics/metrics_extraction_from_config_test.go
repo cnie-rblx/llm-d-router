@@ -381,9 +381,61 @@ func TestMetricsExtractionCustomScalarFromConfig(t *testing.T) {
 	got, ok := attrmetrics.ReadScalarMetricValue(ep.GetAttributes(), attributeKey)
 	require.True(t, ok, "custom scalar metric should be stored as an endpoint attribute")
 	assert.InDelta(t, 42.5, float64(got), 0.001)
+	updatedAt, ok := attrmetrics.ReadScalarMetricUpdateTime(ep.GetAttributes(), attributeKey)
+	require.True(t, ok, "custom scalar metric should record its update time")
+	assert.False(t, updatedAt.IsZero())
 	assert.Zero(t, ep.GetMetrics().WaitingQueueSize)
 	assert.Zero(t, ep.GetMetrics().RunningRequestsSize)
 	assert.Zero(t, ep.GetMetrics().KVCacheUsagePercent)
+}
+
+func TestMetricsExtractionMissingCustomScalarKeepsItsPreviousUpdateTime(t *testing.T) {
+	const (
+		queueKey     = "custom.queue_depth"
+		heartbeatKey = "custom.heartbeat"
+	)
+
+	ext := buildExtractor(t, &modelServerExtractorParams{
+		EngineConfigs: []engineConfigParams{
+			{
+				Name: "vllm",
+				CustomMetrics: []customMetricConfigParams{
+					{AttributeKey: queueKey, MetricSpec: "custom_queue_depth"},
+					{AttributeKey: heartbeatKey, MetricSpec: "custom_heartbeat"},
+				},
+			},
+		},
+	})
+	ep := fwkdl.NewEndpoint(&fwkdl.EndpointMetadata{
+		Labels: map[string]string{DefaultEngineTypeLabelKey: "vllm"},
+	}, fwkdl.NewMetrics())
+	input := func(payload sourcemetrics.PrometheusMetricMap) fwkdl.PollInput[sourcemetrics.PrometheusMetricMap] {
+		return fwkdl.PollInput[sourcemetrics.PrometheusMetricMap]{Endpoint: ep, Payload: payload}
+	}
+	gauge := func(value float64) *dto.MetricFamily {
+		return &dto.MetricFamily{
+			Type: dto.MetricType_GAUGE.Enum(),
+			Metric: []*dto.Metric{
+				{Gauge: &dto.Gauge{Value: ptr.To(value)}},
+			},
+		}
+	}
+
+	require.NoError(t, ext.Extract(context.Background(), input(sourcemetrics.PrometheusMetricMap{
+		"custom_queue_depth": gauge(2),
+		"custom_heartbeat":   gauge(1),
+	})))
+	queueUpdatedAt, ok := attrmetrics.ReadScalarMetricUpdateTime(ep.GetAttributes(), queueKey)
+	require.True(t, ok)
+
+	err := ext.Extract(context.Background(), input(sourcemetrics.PrometheusMetricMap{
+		"custom_heartbeat": gauge(2),
+	}))
+	require.ErrorContains(t, err, "custom_queue_depth")
+	afterMissingScrape, ok := attrmetrics.ReadScalarMetricUpdateTime(ep.GetAttributes(), queueKey)
+	require.True(t, ok)
+	assert.Equal(t, queueUpdatedAt, afterMissingScrape,
+		"a successful update of another metric must not refresh the missing metric")
 }
 
 func TestMetricsExtractionCustomCounterFromConfig(t *testing.T) {

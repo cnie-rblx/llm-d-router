@@ -94,6 +94,7 @@ type Config struct {
 // DefaultConfig returns the default admission thresholds.
 func DefaultConfig() Config {
 	return Config{
+		RejectAllPriorities:       true,
 		MetricsStalenessThreshold: defaultMetricsStalenessThreshold,
 		Decode: DecodeConfig{
 			WaitingQueueThreshold:       defaultDecodeWaitingThreshold,
@@ -219,12 +220,15 @@ func (a *Admitter) Consumes() fwkplugin.DataDependencies {
 		required[a.inFlightLoadDataKey] = attrconcurrency.InFlightLoad{}
 		required[a.uncachedRequestTokensDataKey] = attrconcurrency.UncachedRequestTokens{}
 	}
+	optional := map[fwkplugin.DataKey]any{
+		fwkplugin.NewDataKey(a.config.Decode.Prealloc.AttributeKey, ""):                                        attrmetrics.ScalarMetricValue(0),
+		fwkplugin.NewDataKey(a.config.Decode.Transfer.AttributeKey, ""):                                        attrmetrics.ScalarMetricValue(0),
+		fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(a.config.Decode.Prealloc.AttributeKey), ""): attrmetrics.ScalarMetricUpdateTime{},
+		fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(a.config.Decode.Transfer.AttributeKey), ""): attrmetrics.ScalarMetricUpdateTime{},
+	}
 	return fwkplugin.DataDependencies{
 		Required: required,
-		Optional: map[fwkplugin.DataKey]any{
-			fwkplugin.NewDataKey(a.config.Decode.Prealloc.AttributeKey, ""): attrmetrics.ScalarMetricValue(0),
-			fwkplugin.NewDataKey(a.config.Decode.Transfer.AttributeKey, ""): attrmetrics.ScalarMetricValue(0),
-		},
+		Optional: optional,
 	}
 }
 
@@ -323,16 +327,16 @@ func (a *Admitter) decodeFeasible(request *fwksched.InferenceRequest, endpoint f
 	if metrics.KVCacheUsagePercent >= a.config.Decode.KVCacheUtilizationThreshold {
 		return false, "KV utilization threshold reached"
 	}
-	prealloc, ok := attrmetrics.ReadScalarMetricValue(endpoint, a.config.Decode.Prealloc.AttributeKey)
+	prealloc, ok := a.readFreshSignal(endpoint, a.config.Decode.Prealloc.AttributeKey, now)
 	if !ok {
-		return false, "missing decode preallocation metric"
+		return false, "missing or stale decode preallocation metric"
 	}
 	if float64(prealloc) >= a.config.Decode.Prealloc.Threshold {
 		return false, "decode preallocation threshold reached"
 	}
-	transfer, ok := attrmetrics.ReadScalarMetricValue(endpoint, a.config.Decode.Transfer.AttributeKey)
+	transfer, ok := a.readFreshSignal(endpoint, a.config.Decode.Transfer.AttributeKey, now)
 	if !ok {
-		return false, "missing decode transfer metric"
+		return false, "missing or stale decode transfer metric"
 	}
 	if float64(transfer) >= a.config.Decode.Transfer.Threshold {
 		return false, "decode transfer threshold reached"
@@ -373,6 +377,18 @@ func (a *Admitter) metricsFresh(metrics *fwkdl.Metrics, now time.Time) (bool, st
 		return false, "stale metrics"
 	}
 	return true, ""
+}
+
+func (a *Admitter) readFreshSignal(endpoint fwksched.Endpoint, key string, now time.Time) (attrmetrics.ScalarMetricValue, bool) {
+	value, ok := attrmetrics.ReadScalarMetricValue(endpoint, key)
+	if !ok {
+		return 0, false
+	}
+	updatedAt, ok := attrmetrics.ReadScalarMetricUpdateTime(endpoint, key)
+	if !ok || updatedAt.IsZero() || now.Sub(updatedAt) > a.metricsStalenessThreshold {
+		return 0, false
+	}
+	return value, true
 }
 
 func endpointRoles(endpoint fwksched.Endpoint) (bool, bool) {
