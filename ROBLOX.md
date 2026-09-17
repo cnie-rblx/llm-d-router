@@ -41,3 +41,7 @@ Includes the current request's uncached tokens when estimating prefill TTFT for 
 ## Decode pipeline pressure
 
 Adds a filter that combines ordinary waiting, decode preallocation, and transfer queues into normalized endpoint pressure. It keeps endpoints within a configurable threshold of the least-pressured decode endpoint.
+
+## Precise prefix-cache recovery and scoring
+
+Restores precise prefix-cache signals after cold starts by anchoring replay at the engine's oldest retained sequence and falling back to live indexing when contiguous replay is unavailable. It subscribes only to KV-event publishers, treats globally unknown blocks as missing information rather than cache misses, and counts matches for all endpoints in one pass to avoid excessive per-request allocations.
