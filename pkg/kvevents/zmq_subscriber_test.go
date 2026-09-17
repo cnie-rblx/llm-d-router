@@ -563,14 +563,50 @@ func TestZMQSubscriber_ProactiveReplayAcceptsEndAfterProgress(t *testing.T) {
 	require.Len(t, hits[key], 1, "terminal marker after replay progress must preserve the rebuilt index")
 }
 
-func TestZMQSubscriber_ProactiveReplayRejectsTruncatedHistory(t *testing.T) {
+// A cold join requests sequence 0, but a real engine's replay buffer is bounded
+// and answers from its oldest retained sequence. Rejecting that leaves the index
+// permanently empty, which is strictly worse than indexing the history that is
+// still available: a block whose store and eviction both predate the anchor is
+// unknown either way, so the anchored index under-reports cache hits but never
+// claims a block is resident when it is not.
+func TestZMQSubscriber_ProactiveReplayAnchorsOnOldestRetainedSequence(t *testing.T) {
 	h := newReplayHarness(t, []replayMessage{
-		{seq: 1, payload: buildDistinctBlockStoredPayload(t, 200)},
+		{seq: 28932, payload: buildDistinctBlockStoredPayload(t, 200)},
+		{seq: 28933, payload: buildDistinctBlockStoredPayload(t, 201)},
 	}, false)
 
-	time.Sleep(300 * time.Millisecond)
-	_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(200))
-	require.Error(t, err, "replay starting after the requested sequence must not populate the index")
+	require.Eventually(t, func() bool {
+		key, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(201))
+		if err != nil {
+			return false
+		}
+		hits, err := h.index.Lookup(h.ctx, []kvblock.BlockHash{key}, nil)
+		return err == nil && len(hits[key]) == 1
+	}, 5*time.Second, 50*time.Millisecond,
+		"a bounded replay buffer must still rebuild the index from its oldest retained sequence")
+}
+
+// The anchor applies only to the first event. A hole after it can hide the
+// eviction of a block already recorded, which would make the index claim a
+// block is resident when it is not, so it must still invalidate the replay.
+func TestZMQSubscriber_ProactiveReplayRejectsHoleAfterAnchor(t *testing.T) {
+	h := newReplayHarness(t, []replayMessage{
+		{seq: 28932, payload: buildDistinctBlockStoredPayload(t, 200)},
+		{seq: 28940, payload: buildDistinctBlockStoredPayload(t, 300)},
+	}, false)
+
+	require.Eventually(t, func() bool {
+		key, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(200))
+		if err != nil {
+			return false
+		}
+		hits, err := h.index.Lookup(h.ctx, []kvblock.BlockHash{key}, nil)
+		return err == nil && len(hits[key]) == 0
+	}, 5*time.Second, 50*time.Millisecond,
+		"a gap after the anchor must clear the partially rebuilt index")
+
+	_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(300))
+	require.Error(t, err, "events after the hole must not be indexed")
 }
 
 func TestZMQSubscriber_ProactiveReplayClearsPartialHistoryOnGap(t *testing.T) {
@@ -718,4 +754,67 @@ func TestZMQSubscriber_ReplayedLiveEventsDoNotTriggerAnotherReplay(t *testing.T)
 	h.send(t, 2, payload)
 	time.Sleep(300 * time.Millisecond)
 	assert.Equal(t, int32(1), h.buffer.requests.Load())
+}
+
+// Reproduces production: the engine's replay server pages its buffer, so a cold
+// replay returns a contiguous run and then jumps forward. Retrying forever
+// clears the pod on every cooldown and leaves the index usable only in short
+// windows. The subscriber must instead give up on history and index live
+// events, which is safe because the pod was cleared and every eviction from
+// that point on is observed.
+func TestZMQSubscriber_FallsBackToLiveIndexingWhenReplayCannotBeContiguous(t *testing.T) {
+	h := newReplayHarness(t, []replayMessage{
+		{seq: 100, payload: buildDistinctBlockStoredPayload(t, 100)},
+		// The page boundary: the engine resumes past the sequence we need.
+		{seq: 250, payload: buildDistinctBlockStoredPayload(t, 200)},
+	}, false)
+
+	// The holed history must not survive, otherwise a missed eviction inside the
+	// hole would make the index claim a block is resident when it is not.
+	require.Eventually(t, func() bool {
+		key, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(100))
+		if err != nil {
+			return false
+		}
+		hits, err := h.index.Lookup(h.ctx, []kvblock.BlockHash{key}, nil)
+		return err == nil && len(hits[key]) == 0
+	}, 5*time.Second, 50*time.Millisecond, "partial replay history must be cleared")
+
+	// Live events must now be indexed without waiting out any cooldown, and
+	// without another replay attempt.
+	requestsBefore := h.buffer.requests.Load()
+	h.send(t, 400, buildDistinctBlockStoredPayload(t, 300))
+	require.Eventually(t, func() bool {
+		key, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(300))
+		if err != nil {
+			return false
+		}
+		hits, err := h.index.Lookup(h.ctx, []kvblock.BlockHash{key}, nil)
+		return err == nil && len(hits[key]) == 1
+	}, 5*time.Second, 50*time.Millisecond,
+		"live events must be indexed once replay is abandoned")
+	assert.Equal(t, requestsBefore, h.buffer.requests.Load(),
+		"no further replay should be attempted after the fallback")
+}
+
+// Live-only mode still tracks evictions, which is what makes it safe: the index
+// never outlives the engine's own residency for anything it recorded.
+func TestZMQSubscriber_LiveIndexingStillAppliesEvictions(t *testing.T) {
+	h := newReplayHarness(t, []replayMessage{
+		{seq: 100, payload: buildDistinctBlockStoredPayload(t, 100)},
+		{seq: 250, payload: buildDistinctBlockStoredPayload(t, 200)},
+	}, false)
+
+	h.send(t, 400, buildDistinctBlockStoredPayload(t, 300))
+	require.Eventually(t, func() bool {
+		_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(300))
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond)
+
+	h.send(t, 401, buildBlockRemovedPayload(t, 300))
+	require.Eventually(t, func() bool {
+		_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(300))
+		return err != nil
+	}, 5*time.Second, 50*time.Millisecond,
+		"an eviction observed in live-only mode must remove the block")
 }

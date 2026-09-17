@@ -103,40 +103,59 @@ func fillMaxWeights(dst map[string]float64, entries []kvblock.PodEntry, mediumWe
 }
 
 // Score implements the longest prefix scoring logic with weighted sum based on BackendConfig.
+//
+// A block that no pod is known to hold is skipped rather than treated as a
+// miss, so it neither seeds nor breaks any pod's chain. The index is not
+// authoritative about absence: engines announce a block only when it is newly
+// stored, so a block that has stayed resident since before the index was
+// built is never announced and is therefore absent for every pod. The prompt
+// head is the region most likely to be permanently resident, and anchoring
+// the chain on keys[0] collapsed every pod's score to zero whenever the head
+// was unknown, which removed the routing signal entirely and degraded prefill
+// to pure load balancing.
+//
+// A block that some pods hold and this pod does not is still a genuine miss
+// and ends this pod's chain, so the discriminating power between pods is
+// unchanged. When no block in the prompt is known to any pod there is no
+// information to act on and every pod scores 0, as before.
 func (s *LongestPrefixScorer) Score(
 	_ context.Context,
 	keys []kvblock.BlockHash,
 	keyToPods map[kvblock.BlockHash][]kvblock.PodEntry,
 ) (map[string]float64, error) {
-	if len(keys) == 0 {
-		return make(map[string]float64), nil
-	}
-
 	podScores := make(map[string]float64)
+	if len(keys) == 0 {
+		return podScores, nil
+	}
 
 	// Scratch map reused across iterations to avoid per-key allocation.
 	curWeights := make(map[string]float64)
 
-	// Build weight index for the first key in a single pass over entries.
-	fillMaxWeights(curWeights, keyToPods[keys[0]], s.MediumWeights)
-
-	// activePods tracks pods still in the consecutive prefix chain.
+	// activePods tracks pods still in the consecutive prefix chain. It stays
+	// nil until the first block that any pod is known to hold, so leading
+	// unknown blocks do not decide the outcome.
 	// Using a plain map and in-place deletion avoids allocating new sets
 	// on every iteration.
-	activePods := make(map[string]struct{}, len(curWeights))
-	for pod, w := range curWeights {
-		activePods[pod] = struct{}{}
-		podScores[pod] = w
-	}
+	var activePods map[string]struct{}
 
-	for i := 1; i < len(keys); i++ {
-		if len(activePods) == 0 {
-			break
+	for _, key := range keys {
+		entries := keyToPods[key]
+		if len(entries) == 0 {
+			continue // unknown to the index, not a miss
 		}
 
 		// Reuse scratch map: clear and refill for current key.
 		clear(curWeights)
-		fillMaxWeights(curWeights, keyToPods[keys[i]], s.MediumWeights)
+		fillMaxWeights(curWeights, entries, s.MediumWeights)
+
+		if activePods == nil {
+			activePods = make(map[string]struct{}, len(curWeights))
+			for pod, w := range curWeights {
+				activePods[pod] = struct{}{}
+				podScores[pod] = w
+			}
+			continue
+		}
 
 		// In-place intersection: delete pods from activePods that are not
 		// in the current key, and accumulate scores for those that remain.
@@ -146,6 +165,10 @@ func (s *LongestPrefixScorer) Score(
 			} else {
 				delete(activePods, pod)
 			}
+		}
+
+		if len(activePods) == 0 {
+			break
 		}
 	}
 

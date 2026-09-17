@@ -32,6 +32,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
@@ -63,6 +64,18 @@ type PluginConfig struct {
 	// eviction. Go duration string; defaults to defaultSpeculativeTTL when
 	// empty.
 	SpeculativeTTL string `json:"speculativeTTL"`
+	// SubscriberLabelSelector restricts which endpoints get a KV-events
+	// subscriber, e.g. "llm-d.ai/role=prefill".
+	//
+	// This producer runs as an extractor on an endpoint notification source, so
+	// by default it dials every endpoint in the pool. In a disaggregated
+	// deployment only the prefill engines publish KV events, and subscribing to
+	// the rest produces a permanent retry loop against sockets that will never
+	// exist. Distinct from kvEventsConfig.podDiscoveryConfig.podLabelSelector,
+	// which only applies to the separate discoverPods reconciler path.
+	//
+	// Empty means subscribe to every endpoint.
+	SubscriberLabelSelector string `json:"subscriberLabelSelector,omitempty"`
 }
 
 var (
@@ -109,6 +122,10 @@ type Producer struct {
 	speculativeEnabled bool
 
 	blockSizeTokens int
+
+	// subscriberSelector gates which endpoints get a KV-events subscriber.
+	// nil means every endpoint.
+	subscriberSelector labels.Selector
 
 	// Plugin-lifetime, not request-scoped: SubscriberManager binds each
 	// subscriber's goroutine to the ctx passed at registration.
@@ -158,6 +175,19 @@ func PluginFactory(name string, rawParameters *json.Decoder, handle plugin.Handl
 // The kvcache indexer, KV-events pool, and any local ZMQ subscriber start
 // in background goroutines bound to ctx.
 func New(ctx context.Context, name string, config PluginConfig) (*Producer, error) {
+	// Parsed before anything is constructed: New starts the indexer and the
+	// KV-events pool on background goroutines, so a bad selector should fail
+	// the config rather than leak them.
+	var subscriberSelector labels.Selector
+	if config.SubscriberLabelSelector != "" {
+		parsed, err := labels.Parse(config.SubscriberLabelSelector)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse subscriberLabelSelector %q: %w",
+				config.SubscriberLabelSelector, err)
+		}
+		subscriberSelector = parsed
+	}
+
 	if config.TokenProcessorConfig == nil {
 		config.TokenProcessorConfig = kvblock.DefaultTokenProcessorConfig()
 	}
@@ -213,6 +243,7 @@ func New(ctx context.Context, name string, config PluginConfig) (*Producer, erro
 		speculativeCache:   speculativeCache,
 		speculativeTTL:     speculativeTTL,
 		speculativeEnabled: config.SpeculativeIndexing,
+		subscriberSelector: subscriberSelector,
 		blockSizeTokens:    tokenProcessor.BlockSize(),
 		subscriberCtx:      ctx,
 	}, nil
@@ -370,6 +401,26 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		lookups = append(lookups, promptLookup{keys: blockKeys, keyToPods: keyToPods})
 	}
 
+	// One pass per lookup covering every endpoint, rather than one pass per
+	// endpoint per lookup. See matchedPrefixCounts: the per-endpoint form is
+	// O(endpoints x keys x entries) and was only affordable while it exited on
+	// the first block.
+	cachedBlocks := make(map[string]int, len(endpoints))
+	cachedBlocksByTier := make(map[string]map[string]int, len(endpoints))
+	for _, lu := range lookups {
+		for addr, c := range matchedPrefixCounts(lu.keys, lu.keyToPods) {
+			cachedBlocks[addr] += c.blocks
+			byTier := cachedBlocksByTier[addr]
+			if byTier == nil {
+				byTier = make(map[string]int, len(c.byTier))
+				cachedBlocksByTier[addr] = byTier
+			}
+			for tier, count := range c.byTier {
+				byTier[tier] += count
+			}
+		}
+	}
+
 	maxMatch := 0
 	for _, ep := range endpoints {
 		md := ep.GetMetadata()
@@ -381,19 +432,15 @@ func (p *Producer) produceFromBlockKeys(ctx context.Context, span trace.Span,
 		if matchLen > maxMatch {
 			maxMatch = matchLen
 		}
-		cachedBlocks := 0
-		cachedBlocksByTier := map[string]int{}
-		for _, lu := range lookups {
-			cachedBlocks += matchedBlockCount(lu.keys, lu.keyToPods, addr)
-			for tier, count := range matchedBlockCountByTier(lu.keys, lu.keyToPods, addr) {
-				cachedBlocksByTier[tier] += count
-			}
+		blocksByTier := cachedBlocksByTier[addr]
+		if blocksByTier == nil {
+			blocksByTier = map[string]int{} // WithCachedBlocksByTier expects non-nil
 		}
 		info := attrprefix.NewPrefixCacheMatchInfo(matchLen, totalBlocks, p.blockSizeTokens).
-			WithCachedBlockCount(cachedBlocks).
-			WithCachedBlocksByTier(cachedBlocksByTier)
+			WithCachedBlockCount(cachedBlocks[addr]).
+			WithCachedBlocksByTier(blocksByTier)
 		if len(mmBlockIndices) > 0 {
-			info.WithMM(attrprefix.MMMatchInfo{MatchBlocks: countMMMatchedBlocks(mmBlockIndices, cachedBlocks)})
+			info.WithMM(attrprefix.MMMatchInfo{MatchBlocks: countMMMatchedBlocks(mmBlockIndices, cachedBlocks[addr])})
 		}
 		ep.Put(p.dk.String(), info)
 	}

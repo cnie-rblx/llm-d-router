@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
@@ -71,6 +72,12 @@ func (p *Producer) ensureSubscriber(ctx context.Context, meta *fwkdl.EndpointMet
 		return nil
 	}
 	endpointKey := meta.ID.String()
+	if p.subscriberSelector != nil && !p.subscriberSelector.Matches(labels.Set(meta.Labels)) {
+		log.FromContext(ctx).WithName(p.typedName.String()).V(logging.DEBUG).Info(
+			"Skipping KV-events subscriber, endpoint does not match subscriberLabelSelector",
+			"endpoint", endpointKey, "selector", p.subscriberSelector.String())
+		return nil
+	}
 	port := p.kvEventsConfig.PodDiscoveryConfig.SocketPort + meta.GetRankIndex()
 	zmqEndpoint := fmt.Sprintf("tcp://%s:%d", meta.Address, port)
 	replayEndpoint := ""
