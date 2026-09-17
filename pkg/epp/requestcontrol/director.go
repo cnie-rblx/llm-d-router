@@ -327,6 +327,10 @@ func (d *Director) HandleRequest(ctx context.Context, reqCtx *handlers.RequestCo
 
 	// Run admit request plugins
 	if denyReason := d.runAdmissionPlugins(ctx, reqCtx.SchedulingRequest, snapshotOfCandidatePods); denyReason != nil {
+		var admissionErr errcommon.Error
+		if errors.As(denyReason, &admissionErr) && admissionErr.Code == errcommon.ResourceExhausted {
+			return reqCtx, admissionErr
+		}
 		return reqCtx, errcommon.Error{Code: errcommon.Internal, Msg: fmt.Errorf("request cannot be admitted: %w", denyReason).Error()}
 	}
 

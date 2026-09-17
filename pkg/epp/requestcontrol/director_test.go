@@ -841,6 +841,42 @@ func TestDirector_HandleRequest(t *testing.T) {
 			wantErrCode:             errcommon.Internal,
 		},
 		{
+			name: "resource exhausted denial by admit request plugin",
+			reqBodyMap: map[string]any{
+				"model": model,
+				"messages": []any{
+					map[string]any{
+						"role":    "user",
+						"content": "critical prompt",
+					},
+				},
+			},
+			mockAdmissionController: &mockAdmissionController{admitErr: nil},
+			admitRequestDenialError: fmt.Errorf("wrapped denial: %w", errcommon.Error{
+				Code: errcommon.ResourceExhausted,
+				Msg:  "capacity exhausted",
+			}),
+			wantErrCode: errcommon.ResourceExhausted,
+		},
+		{
+			name: "non-resource exhausted typed denial by admit request plugin",
+			reqBodyMap: map[string]any{
+				"model": model,
+				"messages": []any{
+					map[string]any{
+						"role":    "user",
+						"content": "critical prompt",
+					},
+				},
+			},
+			mockAdmissionController: &mockAdmissionController{admitErr: nil},
+			admitRequestDenialError: errcommon.Error{
+				Code: errcommon.BadRequest,
+				Msg:  "invalid request",
+			},
+			wantErrCode: errcommon.Internal,
+		},
+		{
 			name: "successful chat completions request with multiple messages",
 			reqBodyMap: map[string]any{
 				"model": model,
