@@ -47,8 +47,6 @@ const (
 	defaultMaxOutputTokens           = int64(8192)
 	defaultPreallocAttributeKey      = "sglang.decode_prealloc_queue_reqs"
 	defaultPreallocThreshold         = 8.0
-	defaultTransferAttributeKey      = "sglang.decode_transfer_queue_reqs"
-	defaultTransferThreshold         = 12.0
 	defaultPrefillWaitingThreshold   = 4
 	legacyRoleBoth                   = "both"
 )
@@ -66,7 +64,9 @@ type DecodeConfig struct {
 	DefaultOutputTokens         int64        `json:"defaultOutputTokens"`
 	MaxOutputTokens             int64        `json:"maxOutputTokens"`
 	Prealloc                    SignalConfig `json:"prealloc"`
-	Transfer                    SignalConfig `json:"transfer"`
+	// Deprecated: retained only so existing strict-decoded configurations remain valid.
+	// Transfer-queue depth is not used for admission decisions.
+	Transfer SignalConfig `json:"transfer"`
 }
 
 // PrefillConfig configures prefill capacity checks.
@@ -95,10 +95,6 @@ func DefaultConfig() Config {
 			Prealloc: SignalConfig{
 				AttributeKey: defaultPreallocAttributeKey,
 				Threshold:    defaultPreallocThreshold,
-			},
-			Transfer: SignalConfig{
-				AttributeKey: defaultTransferAttributeKey,
-				Threshold:    defaultTransferThreshold,
 			},
 		},
 		Prefill: PrefillConfig{WaitingQueueThreshold: defaultPrefillWaitingThreshold},
@@ -164,13 +160,11 @@ func validateDecodeConfig(config DecodeConfig) error {
 	if config.MaxOutputTokens <= 0 {
 		return fmt.Errorf("%s decode.maxOutputTokens must be positive, got %d", PluginType, config.MaxOutputTokens)
 	}
-	for name, signal := range map[string]SignalConfig{"prealloc": config.Prealloc, "transfer": config.Transfer} {
-		if signal.AttributeKey == "" {
-			return fmt.Errorf("%s decode.%s.attributeKey must be non-empty", PluginType, name)
-		}
-		if signal.Threshold <= 0 {
-			return fmt.Errorf("%s decode.%s.threshold must be positive, got %v", PluginType, name, signal.Threshold)
-		}
+	if config.Prealloc.AttributeKey == "" {
+		return fmt.Errorf("%s decode.prealloc.attributeKey must be non-empty", PluginType)
+	}
+	if config.Prealloc.Threshold <= 0 {
+		return fmt.Errorf("%s decode.prealloc.threshold must be positive, got %v", PluginType, config.Prealloc.Threshold)
 	}
 	return nil
 }
@@ -187,9 +181,7 @@ func (a *Admitter) Consumes() fwkplugin.DataDependencies {
 	}
 	optional := map[fwkplugin.DataKey]any{
 		fwkplugin.NewDataKey(a.config.Decode.Prealloc.AttributeKey, ""):                                        attrmetrics.ScalarMetricValue(0),
-		fwkplugin.NewDataKey(a.config.Decode.Transfer.AttributeKey, ""):                                        attrmetrics.ScalarMetricValue(0),
 		fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(a.config.Decode.Prealloc.AttributeKey), ""): attrmetrics.ScalarMetricUpdateTime{},
-		fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(a.config.Decode.Transfer.AttributeKey), ""): attrmetrics.ScalarMetricUpdateTime{},
 		fwkplugin.NewDataKey(attrmetrics.WaitingQueueUpdateTimeKey, ""):                                        attrmetrics.CoreMetricUpdateTime{},
 		fwkplugin.NewDataKey(attrmetrics.KVCacheUtilizationUpdateTimeKey, ""):                                  attrmetrics.CoreMetricUpdateTime{},
 		fwkplugin.NewDataKey(attrmetrics.KVCacheCapacityUpdateTimeKey, ""):                                     attrmetrics.CoreMetricUpdateTime{},
@@ -286,13 +278,6 @@ func (a *Admitter) decodeFeasible(request *fwksched.InferenceRequest, endpoint f
 	}
 	if float64(prealloc) >= a.config.Decode.Prealloc.Threshold {
 		return false, "decode preallocation threshold reached"
-	}
-	transfer, ok := a.readFreshSignal(endpoint, a.config.Decode.Transfer.AttributeKey, now)
-	if !ok {
-		return false, "missing or stale decode transfer metric"
-	}
-	if float64(transfer) >= a.config.Decode.Transfer.Threshold {
-		return false, "decode transfer threshold reached"
 	}
 	if !a.coreMetricFresh(endpoint, attrmetrics.KVCacheCapacityUpdateTimeKey, now) {
 		return false, "missing or stale KV token capacity metric"

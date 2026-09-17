@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -53,13 +52,13 @@ func TestFactoryValidation(t *testing.T) {
 		{name: "zero decode waiting", parameters: `{"decode":{"waitingQueueThreshold":0}}`, wantErr: "waitingQueueThreshold"},
 		{name: "bad kv fraction", parameters: `{"decode":{"kvCacheUtilizationThreshold":1.1}}`, wantErr: "kvCacheUtilizationThreshold"},
 		{name: "empty prealloc key", parameters: `{"decode":{"prealloc":{"attributeKey":""}}}`, wantErr: "prealloc.attributeKey"},
-		{name: "zero transfer threshold", parameters: `{"decode":{"transfer":{"threshold":0}}}`, wantErr: "transfer.threshold"},
+		{name: "legacy transfer config ignored", parameters: `{"decode":{"transfer":{"attributeKey":"sglang.decode_transfer_queue_reqs","threshold":12}}}`},
 		{name: "default output over maximum", parameters: `{"decode":{"defaultOutputTokens":9,"maxOutputTokens":8}}`, wantErr: "defaultOutputTokens"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			plugin, err := Factory("test", json.NewDecoder(strings.NewReader(tt.parameters)), nil)
+			plugin, err := Factory("test", fwkplugin.StrictDecoder(json.RawMessage(tt.parameters)), nil)
 			if tt.wantErr == "" {
 				require.NoError(t, err)
 				assert.Equal(t, PluginType, plugin.TypedName().Type)
@@ -79,9 +78,9 @@ func TestConsumesDependencies(t *testing.T) {
 	assert.Contains(t, deps.Required, tokenizer.TokenizedPromptDataKey)
 	assert.Len(t, deps.Required, 1)
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(preallocKey, ""))
-	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(transferKey, ""))
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(preallocKey), ""))
-	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(transferKey), ""))
+	assert.NotContains(t, deps.Optional, fwkplugin.NewDataKey(transferKey, ""))
+	assert.NotContains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(transferKey), ""))
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.WaitingQueueUpdateTimeKey, ""))
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.KVCacheUtilizationUpdateTimeKey, ""))
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.KVCacheCapacityUpdateTimeKey, ""))
@@ -113,12 +112,11 @@ func TestAdmit(t *testing.T) {
 			wantCode: errcommon.ResourceExhausted,
 		},
 		{
-			name: "all decode transfer queues full",
+			name: "transfer queue depth does not gate admission",
 			endpoints: []fwksched.Endpoint{
 				endpoint("prefill", bylabel.RolePrefill, 0, 0.1, 100000, 0, 0, time.Now()),
-				endpoint("decode", bylabel.RoleDecode, 0, 0.1, 100000, 0, 12, time.Now()),
+				endpoint("decode", bylabel.RoleDecode, 0, 0.1, 100000, 0, 100, time.Now()),
 			},
-			wantCode: errcommon.ResourceExhausted,
 		},
 		{
 			name: "all decode ordinary queues full",
@@ -403,7 +401,6 @@ func TestDefaultConfigValues(t *testing.T) {
 	assert.Equal(t, int64(2048), config.Decode.DefaultOutputTokens)
 	assert.Equal(t, int64(8192), config.Decode.MaxOutputTokens)
 	assert.Equal(t, SignalConfig{AttributeKey: preallocKey, Threshold: 8}, config.Decode.Prealloc)
-	assert.Equal(t, SignalConfig{AttributeKey: transferKey, Threshold: 12}, config.Decode.Transfer)
 	assert.Equal(t, 4, config.Prefill.WaitingQueueThreshold)
 }
 

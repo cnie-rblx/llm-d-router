@@ -21,7 +21,7 @@ in-flight token state, so this check remains valid with multiple EPP replicas.
 A decode endpoint must have:
 
 - fresh metrics;
-- ordinary, preallocation, and transfer queues below their thresholds;
+- ordinary and preallocation queues below their thresholds;
 - KV utilization below `kvCacheUtilizationThreshold`; and
 - enough reported free KV-token capacity for the prompt plus its bounded output
   reservation.
@@ -55,9 +55,6 @@ plugins:
       prealloc:
         attributeKey: sglang.decode_prealloc_queue_reqs
         threshold: 8
-      transfer:
-        attributeKey: sglang.decode_transfer_queue_reqs
-        threshold: 12
     prefill:
       waitingQueueThreshold: 4
 ```
@@ -78,9 +75,12 @@ The custom queue attributes must be populated by the metrics extractor:
       customMetrics:
       - attributeKey: sglang.decode_prealloc_queue_reqs
         metricSpec: sglang:num_decode_prealloc_queue_reqs
-      - attributeKey: sglang.decode_transfer_queue_reqs
-        metricSpec: sglang:num_decode_transfer_queue_reqs
 ```
+
+Transfer-queue depth is intentionally not an admission condition. A populated
+transfer queue represents normal pipeline occupancy and can fluctuate while
+transfers continue to drain. It can still be used by scheduling filters and
+scorers to steer traffic away from busier decode endpoints.
 
 `rejectAllPriorities: false` limits rejection to requests with negative
 priority. Set it to `true` when overload protection must also apply to ordinary

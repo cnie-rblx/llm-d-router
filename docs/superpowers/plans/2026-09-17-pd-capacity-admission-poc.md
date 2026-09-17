@@ -87,18 +87,16 @@ decode:
   prealloc:
     attributeKey: sglang.decode_prealloc_queue_reqs
     threshold: 8
-  transfer:
-    attributeKey: sglang.decode_transfer_queue_reqs
-    threshold: 12
 prefill:
   waitingQueueThreshold: 4
 ```
 
 Prefill admission uses engine-observed ordinary waiting only. It does not use EPP-local in-flight state.
+Decode transfer-queue depth is excluded from admission because it represents normal pipeline occupancy; scheduling filters and scorers may still use it for endpoint selection.
 
 - [ ] **Step 4: Write failing behavior tests**
 
-Cover one feasible rank per role; all-decode prealloc, transfer, ordinary-waiting, KV-utilization, and projected-KV rejection; one healthy decode bypassing overloaded peers; all-prefill ordinary-waiting rejection; stale/zero/missing metrics; missing custom metrics; hybrid roles; unlabeled roles; priority bypass; and typed `ResourceExhausted` denials.
+Cover one feasible rank per role; all-decode prealloc, ordinary-waiting, KV-utilization, and projected-KV rejection; high transfer depth remaining admissible; one healthy decode bypassing overloaded peers; all-prefill ordinary-waiting rejection; stale/zero/missing metrics; missing custom metrics; hybrid roles; unlabeled roles; priority bypass; and typed `ResourceExhausted` denials.
 
 - [ ] **Step 5: Run tests and confirm RED**
 
@@ -114,7 +112,7 @@ outputReserve = min(request.MaxOutputTokens, maxOutputTokens), or defaultOutputT
 requiredKVTokens = TokenizedPrompt.TokenCount() + outputReserve
 ```
 
-Require fresh metrics, queue values below thresholds, KV usage below threshold, positive KV capacity, and `requiredKVTokens <= freeKVTokens`.
+Require fresh ordinary-waiting, preallocation, KV-utilization, and KV-capacity metrics; queue values below thresholds; KV usage below threshold; positive KV capacity; and `requiredKVTokens <= freeKVTokens`.
 
 Prefill feasibility requires a fresh engine-reported ordinary waiting queue below threshold. EPP-local in-flight token state is intentionally excluded so admission remains replica-independent.
 
