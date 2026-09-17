@@ -545,6 +545,52 @@ func TestZMQSubscriber_ProactiveReplayResumesAfterPartialResponse(t *testing.T) 
 	}, 5*time.Second, 50*time.Millisecond)
 }
 
+func TestZMQSubscriber_ProactiveReplayReanchorsAcrossPagedResponses(t *testing.T) {
+	h := newReplayHarnessWithPartial(t, []replayMessage{
+		{seq: 0, payload: buildDistinctBlockStoredPayload(t, 100)},
+		{seq: 1, payload: buildDistinctBlockStoredPayload(t, 200)},
+		{seq: 50, payload: buildDistinctBlockStoredPayload(t, 300)},
+		{seq: 51, payload: buildDistinctBlockStoredPayload(t, 400)},
+	}, false, 2)
+
+	require.Eventually(t, func() bool { return h.buffer.requests.Load() == 2 },
+		5*time.Second, 50*time.Millisecond, "the next replay page must be requested")
+	require.Equal(t, uint64(2), h.buffer.lastStartSeq.Load())
+
+	require.Eventually(t, func() bool {
+		key, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(100))
+		if err != nil {
+			return false
+		}
+		hits, err := h.index.Lookup(h.ctx, []kvblock.BlockHash{key}, nil)
+		return err == nil && len(hits[key]) == 0
+	}, 5*time.Second, 50*time.Millisecond,
+		"a jump at the next page must clear the unsafe earlier page")
+	require.Eventually(t, func() bool {
+		key, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(400))
+		if err != nil {
+			return false
+		}
+		hits, err := h.index.Lookup(h.ctx, []kvblock.BlockHash{key}, nil)
+		return err == nil && len(hits[key]) == 1
+	}, 5*time.Second, 50*time.Millisecond,
+		"the contiguous page after the jump must rebuild the index")
+
+	requestsBeforeLive := h.buffer.requests.Load()
+	h.send(t, 100, buildDistinctBlockStoredPayload(t, 500))
+	require.Eventually(t, func() bool {
+		key, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(500))
+		if err != nil {
+			return false
+		}
+		hits, err := h.index.Lookup(h.ctx, []kvblock.BlockHash{key}, nil)
+		return err == nil && len(hits[key]) == 1
+	}, 5*time.Second, 50*time.Millisecond,
+		"an approximate cold replay must hand off once to the live cursor")
+	assert.Equal(t, requestsBeforeLive, h.buffer.requests.Load(),
+		"the expected replay-to-live gap must not start strict gap repair")
+}
+
 func TestZMQSubscriber_ProactiveReplayAcceptsEndAfterProgress(t *testing.T) {
 	h := newReplayHarnessWithPartial(t, []replayMessage{
 		{seq: 0, payload: buildDistinctBlockStoredPayload(t, 100)},
@@ -586,10 +632,10 @@ func TestZMQSubscriber_ProactiveReplayAnchorsOnOldestRetainedSequence(t *testing
 		"a bounded replay buffer must still rebuild the index from its oldest retained sequence")
 }
 
-// The anchor applies only to the first event. A hole after it can hide the
-// eviction of a block already recorded, which would make the index claim a
-// block is resident when it is not, so it must still invalidate the replay.
-func TestZMQSubscriber_ProactiveReplayRejectsHoleAfterAnchor(t *testing.T) {
+// SGLang can page cold-start replay with a forward sequence jump. The prefix
+// before the jump is unsafe because the hole may contain an eviction, so the
+// subscriber must clear it and retain only the contiguous suffix.
+func TestZMQSubscriber_ProactiveReplayReanchorsAfterPageJump(t *testing.T) {
 	h := newReplayHarness(t, []replayMessage{
 		{seq: 28932, payload: buildDistinctBlockStoredPayload(t, 200)},
 		{seq: 28940, payload: buildDistinctBlockStoredPayload(t, 300)},
@@ -603,13 +649,20 @@ func TestZMQSubscriber_ProactiveReplayRejectsHoleAfterAnchor(t *testing.T) {
 		hits, err := h.index.Lookup(h.ctx, []kvblock.BlockHash{key}, nil)
 		return err == nil && len(hits[key]) == 0
 	}, 5*time.Second, 50*time.Millisecond,
-		"a gap after the anchor must clear the partially rebuilt index")
+		"a page jump must clear the unsafe replay prefix")
 
-	_, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(300))
-	require.Error(t, err, "events after the hole must not be indexed")
+	require.Eventually(t, func() bool {
+		key, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(300))
+		if err != nil {
+			return false
+		}
+		hits, err := h.index.Lookup(h.ctx, []kvblock.BlockHash{key}, nil)
+		return err == nil && len(hits[key]) == 1
+	}, 5*time.Second, 50*time.Millisecond,
+		"the contiguous suffix after a page jump must rebuild the index")
 }
 
-func TestZMQSubscriber_ProactiveReplayClearsPartialHistoryOnGap(t *testing.T) {
+func TestZMQSubscriber_ProactiveReplayKeepsOnlySuffixAfterGap(t *testing.T) {
 	h := newReplayHarness(t, []replayMessage{
 		{seq: 0, payload: buildDistinctBlockStoredPayload(t, 100)},
 		{seq: 2, payload: buildDistinctBlockStoredPayload(t, 300)},
@@ -626,7 +679,15 @@ func TestZMQSubscriber_ProactiveReplayClearsPartialHistoryOnGap(t *testing.T) {
 		}
 		hits, err := h.index.Lookup(h.ctx, []kvblock.BlockHash{key}, nil)
 		return err == nil && len(hits[key]) == 0
-	}, 5*time.Second, 50*time.Millisecond, "incomplete replay must clear partial index state")
+	}, 5*time.Second, 50*time.Millisecond, "a replay gap must clear the unsafe prefix")
+	require.Eventually(t, func() bool {
+		key, err := h.index.GetRequestKey(h.ctx, kvblock.BlockHash(300))
+		if err != nil {
+			return false
+		}
+		hits, err := h.index.Lookup(h.ctx, []kvblock.BlockHash{key}, nil)
+		return err == nil && len(hits[key]) == 1
+	}, 5*time.Second, 50*time.Millisecond, "the post-gap suffix must be indexed")
 }
 
 func TestZMQSubscriber_ProactiveReplayUsesInactivityDeadline(t *testing.T) {
@@ -756,17 +817,13 @@ func TestZMQSubscriber_ReplayedLiveEventsDoNotTriggerAnotherReplay(t *testing.T)
 	assert.Equal(t, int32(1), h.buffer.requests.Load())
 }
 
-// Reproduces production: the engine's replay server pages its buffer, so a cold
-// replay returns a contiguous run and then jumps forward. Retrying forever
-// clears the pod on every cooldown and leaves the index usable only in short
-// windows. The subscriber must instead give up on history and index live
-// events, which is safe because the pod was cleared and every eviction from
-// that point on is observed.
+// A replay that cannot be safely re-anchored must still fall back to live
+// indexing. A backward sequence is not a page jump: accepting it would process
+// an older epoch after a newer one.
 func TestZMQSubscriber_FallsBackToLiveIndexingWhenReplayCannotBeContiguous(t *testing.T) {
 	h := newReplayHarness(t, []replayMessage{
 		{seq: 100, payload: buildDistinctBlockStoredPayload(t, 100)},
-		// The page boundary: the engine resumes past the sequence we need.
-		{seq: 250, payload: buildDistinctBlockStoredPayload(t, 200)},
+		{seq: 50, payload: buildDistinctBlockStoredPayload(t, 200)},
 	}, false)
 
 	// The holed history must not survive, otherwise a missed eviction inside the
@@ -802,7 +859,7 @@ func TestZMQSubscriber_FallsBackToLiveIndexingWhenReplayCannotBeContiguous(t *te
 func TestZMQSubscriber_LiveIndexingStillAppliesEvictions(t *testing.T) {
 	h := newReplayHarness(t, []replayMessage{
 		{seq: 100, payload: buildDistinctBlockStoredPayload(t, 100)},
-		{seq: 250, payload: buildDistinctBlockStoredPayload(t, 200)},
+		{seq: 50, payload: buildDistinctBlockStoredPayload(t, 200)},
 	}, false)
 
 	h.send(t, 400, buildDistinctBlockStoredPayload(t, 300))

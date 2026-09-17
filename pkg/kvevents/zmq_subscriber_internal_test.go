@@ -15,9 +15,11 @@
 package kvevents
 
 import (
+	"context"
 	"encoding/binary"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -93,4 +95,19 @@ func TestReplayTerminalFrame(t *testing.T) {
 			assert.Equal(t, tt.want, isReplayTerminalFrame(tt.frames))
 		})
 	}
+}
+
+func TestWaitForReplayQueueCapacity(t *testing.T) {
+	pool := &Pool{}
+	subscriber := &zmqSubscriber{pool: pool}
+	pool.queueDepth.Store(maxReplayQueueDepth)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	assert.False(t, subscriber.waitForReplayQueueCapacity(ctx),
+		"a saturated replay queue must respect cancellation")
+
+	pool.queueDepth.Store(maxReplayQueueDepth - 1)
+	assert.True(t, subscriber.waitForReplayQueueCapacity(context.Background()),
+		"replay may proceed below the queue cap")
 }

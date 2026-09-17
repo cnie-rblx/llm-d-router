@@ -35,8 +35,10 @@ const (
 	replayAttemptIdleTimeout    = 2 * time.Second
 	replayRetryBackoff          = 100 * time.Millisecond
 	replayCooldown              = 30 * time.Second
-	maxConcurrentReplay         = 8
+	maxConcurrentReplay         = 2
 	maxReplayNoProgressAttempts = 3
+	maxReplayQueueDepth         = 512
+	replayQueuePollInterval     = 5 * time.Millisecond
 )
 
 var processReplayLimiter = semaphore.NewWeighted(maxConcurrentReplay)
@@ -57,6 +59,11 @@ type zmqSubscriber struct {
 	lastLiveSeq       uint64
 	hasLastLiveSeq    bool
 	lastReplayFailure time.Time
+	// joinLiveAfterReplay allows one forward jump from an approximate,
+	// re-anchored cold replay to the already-buffered live stream. Without it,
+	// that expected handoff gap starts strict gap replay forever on a busy
+	// engine whose replay cursor cannot catch the publisher.
+	joinLiveAfterReplay bool
 	// liveOnly stops cold-start replay attempts after one has failed, so the
 	// index is rebuilt from live events instead of being cleared on every
 	// cooldown. See the fallback in receiveLoop for why this is safe.
@@ -221,6 +228,7 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 			z.lastSeq = 0
 			z.hasLastSeq = false
 			z.lastReplayFailure = time.Time{}
+			z.joinLiveAfterReplay = false
 			// A restarted engine starts a fresh, short buffer, so a full replay
 			// can succeed again even if it failed for the previous lifetime.
 			z.liveOnly = false
@@ -242,18 +250,25 @@ func (z *zmqSubscriber) runSubscriber(ctx context.Context) {
 
 		if z.hasLastSeq && seq > z.lastSeq+1 {
 			missed := seq - z.lastSeq - 1
-			if !z.canAttemptReplay() {
+			if z.joinLiveAfterReplay {
+				logger.Info("Joining live stream after approximate cold replay",
+					"lastSeq", z.lastSeq, "currentSeq", seq, "missed", missed,
+					"endpoint", z.endpoint)
+				z.lastSeq = seq - 1
+				z.joinLiveAfterReplay = false
+			} else if !z.canAttemptReplay() {
 				debugLogger.Info("Dropping event while replay is in cooldown",
 					"lastSeq", z.lastSeq, "currentSeq", seq, "missed", missed,
 					"endpoint", z.endpoint)
 				continue
-			}
-			logger.Info("Detected gap in event sequence, requesting replay",
-				"lastSeq", z.lastSeq, "currentSeq", seq, "missed", missed,
-				"endpoint", z.endpoint)
-			replayAttempted = true
-			if !z.requestReplay(ctx, z.lastSeq+1) {
-				continue
+			} else {
+				logger.Info("Detected gap in event sequence, requesting replay",
+					"lastSeq", z.lastSeq, "currentSeq", seq, "missed", missed,
+					"endpoint", z.endpoint)
+				replayAttempted = true
+				if !z.requestReplay(ctx, z.lastSeq+1) {
+					continue
+				}
 			}
 		}
 
@@ -309,6 +324,21 @@ func (z *zmqSubscriber) addTask(topic string, seq uint64, payload []byte) {
 	})
 }
 
+// waitForReplayQueueCapacity prevents cold-start replay from filling the
+// unbounded worker queues faster than the index can consume event batches.
+// Live events remain non-blocking; replay is only a warm-up optimization and
+// may time out and fall back to live indexing instead of risking an OOM.
+func (z *zmqSubscriber) waitForReplayQueueCapacity(ctx context.Context) bool {
+	for z.pool.queueDepth.Load() >= maxReplayQueueDepth {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(replayQueuePollInterval):
+		}
+	}
+	return true
+}
+
 func (z *zmqSubscriber) canAttemptReplay() bool {
 	return z.lastReplayFailure.IsZero() || time.Since(z.lastReplayFailure) >= replayCooldown
 }
@@ -317,6 +347,7 @@ func (z *zmqSubscriber) invalidateReplay(topic string) {
 	z.pool.resetForSource(topic, z.sourceEndpoint)
 	z.lastSeq = 0
 	z.hasLastSeq = false
+	z.joinLiveAfterReplay = false
 	z.lastReplayFailure = time.Now()
 }
 
@@ -325,10 +356,25 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 	logger := log.FromContext(ctx).WithName("zmq-replay")
 	debugLogger := logger.V(logging.DEBUG)
 
+	waitStarted := time.Now()
+	if err := processReplayLimiter.Acquire(ctx, 1); err != nil {
+		metrics.ZMQErrors.WithLabelValues(z.podIdentifier, "replay-capacity").Inc()
+		logger.Info("Replay canceled while waiting for process capacity",
+			"waitDuration", time.Since(waitStarted),
+			"replayEndpoint", z.replayEndpoint)
+		return false
+	}
+	defer processReplayLimiter.Release(1)
+	if waitDuration := time.Since(waitStarted); waitDuration >= time.Second {
+		logger.Info("Replay admitted after waiting for process capacity",
+			"waitDuration", waitDuration, "replayEndpoint", z.replayEndpoint)
+	}
+
 	replayCtx, cancel := context.WithTimeout(ctx, replayTimeout)
 	defer cancel()
 
 	replayed := 0
+	reanchored := false
 	nextSeq := startSeq
 	attempt := 0
 	noProgressAttempts := 0
@@ -357,28 +403,11 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 			attemptCancel()
 			continue
 		}
-		waitStarted := time.Now()
-		if err := processReplayLimiter.Acquire(replayCtx, 1); err != nil {
-			dealer.Close()
-			attemptCancel()
-			z.invalidateReplay(z.topicFilter)
-			metrics.ZMQErrors.WithLabelValues(z.podIdentifier, "replay-capacity").Inc()
-			logger.Info("Replay timed out waiting for process capacity",
-				"waitDuration", time.Since(waitStarted),
-				"replayEndpoint", z.replayEndpoint)
-			return false
-		}
-		if waitDuration := time.Since(waitStarted); waitDuration >= time.Second {
-			logger.Info("Replay admitted after waiting for process capacity",
-				"waitDuration", waitDuration, "replayEndpoint", z.replayEndpoint)
-		}
-
 		seqBytes := make([]byte, 8)
 		binary.BigEndian.PutUint64(seqBytes, nextSeq)
 		if err := dealer.SendMulti(zmq4.NewMsgFrom([]byte{}, seqBytes)); err != nil {
 			dealer.Close()
 			attemptCancel()
-			processReplayLimiter.Release(1)
 			z.invalidateReplay(z.topicFilter)
 			metrics.ZMQErrors.WithLabelValues(z.podIdentifier, "replay-send").Inc()
 			logger.Error(err, "Failed to send replay request",
@@ -416,20 +445,24 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 			}
 			if seq != expectedSeq {
 				// A cold join (startSeq == 0) asks for the whole history, but an
-				// engine's replay buffer is bounded and answers from its oldest
-				// retained sequence. Demanding an exact match rejects every
-				// bounded buffer and leaves the index permanently empty, so
-				// anchor on whatever the engine can still offer.
+				// engine may answer from its oldest retained sequence and may
+				// page a replay with forward jumps between responses. Demanding
+				// exact contiguity leaves the index permanently empty.
 				//
-				// Skipping a contiguous prefix of history is safe: a block whose
-				// store and eviction both predate the anchor is simply unknown,
-				// which is self-consistent. A hole in the middle is not, because
-				// it can hide the eviction of a block we already recorded, so
-				// contiguity is still enforced after the anchor and for gap
-				// replays, where startSeq > 0.
-				if startSeq == 0 && replayed == 0 && seq > expectedSeq {
-					logger.Info("Anchoring cold-start replay at the engine's oldest retained sequence",
-						"requestedSeq", startSeq, "anchorSeq", seq,
+				// A forward jump can hide an eviction of a block already
+				// replayed, so retaining the prefix would be unsafe. Queue a
+				// reset before the new suffix and re-anchor there instead. The
+				// ordered per-source queue guarantees that only the final
+				// contiguous suffix survives. Gap replays (startSeq > 0) remain
+				// strict because they repair an already-serving index.
+				if startSeq == 0 && seq > expectedSeq {
+					if replayed > 0 {
+						z.pool.resetForSource(topic, z.sourceEndpoint)
+					}
+					reanchored = true
+					logger.Info("Re-anchoring cold-start replay at next available sequence",
+						"requestedSeq", startSeq, "expectedSeq", expectedSeq,
+						"anchorSeq", seq, "replayed", replayed,
 						"replayEndpoint", z.replayEndpoint)
 					expectedSeq = seq
 				} else {
@@ -444,12 +477,15 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 			replayed++
 			attemptReplayed++
 			expectedSeq++
+			if !z.waitForReplayQueueCapacity(replayCtx) {
+				receiveErr = replayCtx.Err()
+				break
+			}
 		}
 
 		idleTimer.Stop()
 		dealer.Close()
 		attemptCancel()
-		processReplayLimiter.Release(1)
 		if terminalErr != nil {
 			z.invalidateReplay(z.topicFilter)
 			metrics.ZMQErrors.WithLabelValues(z.podIdentifier, "replay-incomplete").Inc()
@@ -469,6 +505,9 @@ func (z *zmqSubscriber) requestReplay(ctx context.Context, startSeq uint64) bool
 				return false
 			}
 			z.lastReplayFailure = time.Time{}
+			if startSeq == 0 && reanchored {
+				z.joinLiveAfterReplay = true
+			}
 			logger.Info("Replay complete", "replayed", replayed,
 				"attempts", attempt, "startSeq", startSeq,
 				"replayEndpoint", z.replayEndpoint)
