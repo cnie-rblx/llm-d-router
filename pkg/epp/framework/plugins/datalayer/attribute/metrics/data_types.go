@@ -28,8 +28,6 @@ const (
 	WaitingQueueUpdateTimeKey = "core-metrics.waiting-queue.updateTime"
 	// KVCacheUtilizationUpdateTimeKey identifies the KV-utilization scrape timestamp.
 	KVCacheUtilizationUpdateTimeKey = "core-metrics.kv-cache-utilization.updateTime"
-	// KVCacheCapacityUpdateTimeKey identifies the KV-capacity scrape timestamp.
-	KVCacheCapacityUpdateTimeKey = "core-metrics.kv-cache-capacity.updateTime"
 )
 
 // ScalarMetricValue is a numeric endpoint attribute extracted from a configured scalar metric.

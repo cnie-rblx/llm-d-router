@@ -62,11 +62,11 @@ Run `git add pkg/epp/requestcontrol/director.go pkg/epp/requestcontrol/director_
 
 **Interfaces:**
 - Produces: plugin type `pd-capacity-admitter` implementing `requestcontrol.Admitter` and `plugin.ConsumerPlugin`.
-- Consumes: core endpoint metrics, configured scalar custom-metric attributes, and tokenized prompt data.
+- Consumes: core endpoint metrics and configured scalar custom-metric attributes.
 
 - [ ] **Step 1: Write failing factory and dependency tests**
 
-Cover defaults, malformed duration, non-positive thresholds, invalid KV fraction, invalid output-token bounds, and conditional inflight-load dependencies when prefill predicted-wait enforcement is enabled.
+Cover defaults, malformed duration, non-positive queue thresholds, invalid KV fraction, and strict-decoder compatibility for deprecated fields.
 
 - [ ] **Step 2: Run package tests and confirm RED**
 
@@ -82,8 +82,6 @@ metricsStalenessThreshold: 12s
 decode:
   waitingQueueThreshold: 4
   kvCacheUtilizationThreshold: 0.92
-  defaultOutputTokens: 2048
-  maxOutputTokens: 8192
   prealloc:
     attributeKey: sglang.decode_prealloc_queue_reqs
     threshold: 8
@@ -96,7 +94,7 @@ Decode transfer-queue depth is excluded from admission because it represents nor
 
 - [ ] **Step 4: Write failing behavior tests**
 
-Cover one feasible rank per role; all-decode prealloc, ordinary-waiting, KV-utilization, and projected-KV rejection; high transfer depth remaining admissible; one healthy decode bypassing overloaded peers; all-prefill ordinary-waiting rejection; stale/zero/missing metrics; missing custom metrics; hybrid roles; unlabeled roles; priority bypass; and typed `ResourceExhausted` denials.
+Cover one feasible rank per role; all-decode prealloc, ordinary-waiting, and KV-utilization rejection; request size, KV capacity, and high transfer depth remaining non-gating; one healthy decode bypassing overloaded peers; all-prefill ordinary-waiting rejection; stale/zero/missing metrics; missing custom metrics; hybrid roles; unlabeled roles; priority bypass; and typed `ResourceExhausted` denials.
 
 - [ ] **Step 5: Run tests and confirm RED**
 
@@ -104,15 +102,7 @@ Run the Task 2 package test and confirm the behavior tests fail for missing logi
 
 - [ ] **Step 6: Implement endpoint evaluation**
 
-Decode feasibility uses:
-
-```text
-freeKVTokens = KvCacheMaxTokenCapacity * (1 - KVCacheUsagePercent)
-outputReserve = min(request.MaxOutputTokens, maxOutputTokens), or defaultOutputTokens when absent
-requiredKVTokens = TokenizedPrompt.TokenCount() + outputReserve
-```
-
-Require fresh ordinary-waiting, preallocation, KV-utilization, and KV-capacity metrics; queue values below thresholds; KV usage below threshold; positive KV capacity; and `requiredKVTokens <= freeKVTokens`.
+Decode feasibility requires fresh ordinary-waiting, preallocation, and KV-utilization metrics; queue values below thresholds; and KV usage below threshold. Request size and projected free KV tokens are excluded because the snapshot does not reserve capacity or bind scheduling to the endpoint that passed admission.
 
 Prefill feasibility requires a fresh engine-reported ordinary waiting queue below threshold. EPP-local in-flight token state is intentionally excluded so admission remains replica-independent.
 

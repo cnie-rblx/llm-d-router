@@ -20,17 +20,14 @@ in-flight token state, so this check remains valid with multiple EPP replicas.
 
 A decode endpoint must have:
 
-- fresh metrics;
+- fresh ordinary-queue, preallocation-queue, and KV-utilization metrics;
 - ordinary and preallocation queues below their thresholds;
-- KV utilization below `kvCacheUtilizationThreshold`; and
-- enough reported free KV-token capacity for the prompt plus its bounded output
-  reservation.
+- KV utilization below `kvCacheUtilizationThreshold`.
 
 The plugin is stateless and evaluates each metrics snapshot independently.
 The core metrics extractor timestamps each required signal independently and
-derives KV-token capacity as `cacheBlockSize * cacheNumBlocks`. Missing metrics,
-missing custom attributes, zero timestamps, and stale metrics make only the
-affected endpoint unavailable.
+missing metrics, missing custom attributes, zero timestamps, and stale metrics
+make only the affected endpoint unavailable.
 
 ## Configuration
 
@@ -39,10 +36,6 @@ not a scheduling-profile plugin.
 
 ```yaml
 plugins:
-- type: token-producer
-  parameters:
-    sglang:
-      url: http://tokenizer:8000
 - type: pd-capacity-admitter
   parameters:
     rejectAllPriorities: true
@@ -50,8 +43,6 @@ plugins:
     decode:
       waitingQueueThreshold: 4
       kvCacheUtilizationThreshold: 0.92
-      defaultOutputTokens: 2048
-      maxOutputTokens: 8192
       prealloc:
         attributeKey: sglang.decode_prealloc_queue_reqs
         threshold: 8
@@ -70,8 +61,6 @@ The custom queue attributes must be populated by the metrics extractor:
       queuedRequestsSpec: sglang:num_queue_reqs
       runningRequestsSpec: sglang:num_running_reqs
       kvUsageSpec: sglang:token_usage
-      cacheBlockSizeSpec: sglang:page_size
-      cacheNumBlocksSpec: sglang:num_pages
       customMetrics:
       - attributeKey: sglang.decode_prealloc_queue_reqs
         metricSpec: sglang:num_decode_prealloc_queue_reqs
@@ -81,6 +70,13 @@ Transfer-queue depth is intentionally not an admission condition. A populated
 transfer queue represents normal pipeline occupancy and can fluctuate while
 transfers continue to drain. It can still be used by scheduling filters and
 scorers to steer traffic away from busier decode endpoints.
+
+Request size and projected free KV tokens are also intentionally excluded.
+Snapshot-based capacity checks do not reserve the reported headroom or bind the
+request to the endpoint that passed the check. Size-aware admission therefore
+belongs with endpoint selection and reservation, or in a decode-side guard.
+The legacy `decode.defaultOutputTokens` and `decode.maxOutputTokens` fields are
+still accepted for strict-decoding compatibility but have no effect.
 
 `rejectAllPriorities: false` limits rejection to requests with negative
 priority. Set it to `true` when overload protection must also apply to ordinary

@@ -164,11 +164,9 @@ func TestMetricsExtractionDefaultConfig(t *testing.T) {
 	assert.Contains(t, m.WaitingModels, "adapter-c")
 	assert.Equal(t, 16, m.CacheBlockSize, "CacheBlockSize")
 	assert.Equal(t, 512, m.CacheNumBlocks, "CacheNumBlocks")
-	assert.Equal(t, 8192, m.KvCacheMaxTokenCapacity, "KvCacheMaxTokenCapacity")
 	for _, key := range []string{
 		attrmetrics.WaitingQueueUpdateTimeKey,
 		attrmetrics.KVCacheUtilizationUpdateTimeKey,
-		attrmetrics.KVCacheCapacityUpdateTimeKey,
 	} {
 		updatedAt, ok := attrmetrics.ReadCoreMetricUpdateTime(ep.GetAttributes(), key)
 		require.True(t, ok, "%s should have an update timestamp", key)

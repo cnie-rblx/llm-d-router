@@ -30,10 +30,8 @@ import (
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
-	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrmetrics "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/metrics"
-	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
 )
 
@@ -43,8 +41,6 @@ const (
 	defaultMetricsStalenessThreshold = "12s"
 	defaultDecodeWaitingThreshold    = 4
 	defaultDecodeKVThreshold         = 0.92
-	defaultOutputTokens              = int64(2048)
-	defaultMaxOutputTokens           = int64(8192)
 	defaultPreallocAttributeKey      = "sglang.decode_prealloc_queue_reqs"
 	defaultPreallocThreshold         = 8.0
 	defaultPrefillWaitingThreshold   = 4
@@ -61,9 +57,11 @@ type SignalConfig struct {
 type DecodeConfig struct {
 	WaitingQueueThreshold       int          `json:"waitingQueueThreshold"`
 	KVCacheUtilizationThreshold float64      `json:"kvCacheUtilizationThreshold"`
-	DefaultOutputTokens         int64        `json:"defaultOutputTokens"`
-	MaxOutputTokens             int64        `json:"maxOutputTokens"`
 	Prealloc                    SignalConfig `json:"prealloc"`
+	// Deprecated: retained only so existing strict-decoded configurations remain valid.
+	// Output-token reservations are not used for admission decisions.
+	DefaultOutputTokens int64 `json:"defaultOutputTokens"`
+	MaxOutputTokens     int64 `json:"maxOutputTokens"`
 	// Deprecated: retained only so existing strict-decoded configurations remain valid.
 	// Transfer-queue depth is not used for admission decisions.
 	Transfer SignalConfig `json:"transfer"`
@@ -90,8 +88,6 @@ func DefaultConfig() Config {
 		Decode: DecodeConfig{
 			WaitingQueueThreshold:       defaultDecodeWaitingThreshold,
 			KVCacheUtilizationThreshold: defaultDecodeKVThreshold,
-			DefaultOutputTokens:         defaultOutputTokens,
-			MaxOutputTokens:             defaultMaxOutputTokens,
 			Prealloc: SignalConfig{
 				AttributeKey: defaultPreallocAttributeKey,
 				Threshold:    defaultPreallocThreshold,
@@ -154,12 +150,6 @@ func validateDecodeConfig(config DecodeConfig) error {
 	if config.KVCacheUtilizationThreshold <= 0 || config.KVCacheUtilizationThreshold > 1 {
 		return fmt.Errorf("%s decode.kvCacheUtilizationThreshold must be in (0, 1], got %v", PluginType, config.KVCacheUtilizationThreshold)
 	}
-	if config.DefaultOutputTokens < 0 || config.DefaultOutputTokens > config.MaxOutputTokens {
-		return fmt.Errorf("%s decode.defaultOutputTokens must be between 0 and maxOutputTokens, got %d", PluginType, config.DefaultOutputTokens)
-	}
-	if config.MaxOutputTokens <= 0 {
-		return fmt.Errorf("%s decode.maxOutputTokens must be positive, got %d", PluginType, config.MaxOutputTokens)
-	}
 	if config.Prealloc.AttributeKey == "" {
 		return fmt.Errorf("%s decode.prealloc.attributeKey must be non-empty", PluginType)
 	}
@@ -174,20 +164,15 @@ func (a *Admitter) TypedName() fwkplugin.TypedName {
 	return a.typedName
 }
 
-// Consumes declares request and endpoint data needed by admission checks.
+// Consumes declares endpoint data needed by admission checks.
 func (a *Admitter) Consumes() fwkplugin.DataDependencies {
-	required := map[fwkplugin.DataKey]any{
-		tokenizer.TokenizedPromptDataKey: fwkrh.TokenizedPrompt{},
-	}
 	optional := map[fwkplugin.DataKey]any{
 		fwkplugin.NewDataKey(a.config.Decode.Prealloc.AttributeKey, ""):                                        attrmetrics.ScalarMetricValue(0),
 		fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(a.config.Decode.Prealloc.AttributeKey), ""): attrmetrics.ScalarMetricUpdateTime{},
 		fwkplugin.NewDataKey(attrmetrics.WaitingQueueUpdateTimeKey, ""):                                        attrmetrics.CoreMetricUpdateTime{},
 		fwkplugin.NewDataKey(attrmetrics.KVCacheUtilizationUpdateTimeKey, ""):                                  attrmetrics.CoreMetricUpdateTime{},
-		fwkplugin.NewDataKey(attrmetrics.KVCacheCapacityUpdateTimeKey, ""):                                     attrmetrics.CoreMetricUpdateTime{},
 	}
 	return fwkplugin.DataDependencies{
-		Required: required,
 		Optional: optional,
 	}
 }
@@ -214,7 +199,7 @@ func (a *Admitter) Admit(ctx context.Context, request *fwksched.InferenceRequest
 		}
 		if decodeRole {
 			decodeTotal++
-			if ok, reason := a.decodeFeasible(request, endpoint, now); ok {
+			if ok, reason := a.decodeFeasible(endpoint, now); ok {
 				decodeAvailable++
 			} else {
 				logger.V(logutil.DEBUG).Info("P/D capacity admitter excluded decode endpoint", "endpoint", endpointName(endpoint), "reason", reason)
@@ -255,7 +240,7 @@ func (a *Admitter) prefillFeasible(endpoint fwksched.Endpoint, now time.Time) (b
 	return true, ""
 }
 
-func (a *Admitter) decodeFeasible(request *fwksched.InferenceRequest, endpoint fwksched.Endpoint, now time.Time) (bool, string) {
+func (a *Admitter) decodeFeasible(endpoint fwksched.Endpoint, now time.Time) (bool, string) {
 	metrics := endpoint.GetMetrics()
 	if metrics == nil {
 		return false, "missing metrics"
@@ -279,32 +264,7 @@ func (a *Admitter) decodeFeasible(request *fwksched.InferenceRequest, endpoint f
 	if float64(prealloc) >= a.config.Decode.Prealloc.Threshold {
 		return false, "decode preallocation threshold reached"
 	}
-	if !a.coreMetricFresh(endpoint, attrmetrics.KVCacheCapacityUpdateTimeKey, now) {
-		return false, "missing or stale KV token capacity metric"
-	}
-	if metrics.KvCacheMaxTokenCapacity <= 0 {
-		return false, "missing KV token capacity"
-	}
-	requiredTokens, ok := a.requiredKVTokens(request)
-	if !ok {
-		return false, "missing tokenized request"
-	}
-	freeTokens := float64(metrics.KvCacheMaxTokenCapacity) * (1 - metrics.KVCacheUsagePercent)
-	if float64(requiredTokens) > freeTokens {
-		return false, "projected request KV does not fit"
-	}
 	return true, ""
-}
-
-func (a *Admitter) requiredKVTokens(request *fwksched.InferenceRequest) (int64, bool) {
-	if request == nil || request.Body == nil || request.Body.TokenizedPrompt == nil {
-		return 0, false
-	}
-	outputTokens := a.config.Decode.DefaultOutputTokens
-	if requested := request.Body.MaxOutputTokens; requested != nil {
-		outputTokens = max(0, min(*requested, a.config.Decode.MaxOutputTokens))
-	}
-	return int64(request.Body.TokenizedPrompt.TokenCount()) + outputTokens, true
 }
 
 func (a *Admitter) coreMetricFresh(endpoint fwksched.Endpoint, key string, now time.Time) bool {

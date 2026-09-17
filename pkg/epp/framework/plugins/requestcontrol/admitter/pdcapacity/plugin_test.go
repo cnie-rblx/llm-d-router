@@ -32,7 +32,6 @@ import (
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrmetrics "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/metrics"
-	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
 )
 
@@ -53,7 +52,7 @@ func TestFactoryValidation(t *testing.T) {
 		{name: "bad kv fraction", parameters: `{"decode":{"kvCacheUtilizationThreshold":1.1}}`, wantErr: "kvCacheUtilizationThreshold"},
 		{name: "empty prealloc key", parameters: `{"decode":{"prealloc":{"attributeKey":""}}}`, wantErr: "prealloc.attributeKey"},
 		{name: "legacy transfer config ignored", parameters: `{"decode":{"transfer":{"attributeKey":"sglang.decode_transfer_queue_reqs","threshold":12}}}`},
-		{name: "default output over maximum", parameters: `{"decode":{"defaultOutputTokens":9,"maxOutputTokens":8}}`, wantErr: "defaultOutputTokens"},
+		{name: "legacy output reservation config ignored", parameters: `{"decode":{"defaultOutputTokens":9,"maxOutputTokens":8}}`},
 	}
 
 	for _, tt := range tests {
@@ -75,15 +74,14 @@ func TestConsumesDependencies(t *testing.T) {
 	admitter, err := New("test", config)
 	require.NoError(t, err)
 	deps := admitter.Consumes()
-	assert.Contains(t, deps.Required, tokenizer.TokenizedPromptDataKey)
-	assert.Len(t, deps.Required, 1)
+	assert.Empty(t, deps.Required)
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(preallocKey, ""))
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(preallocKey), ""))
 	assert.NotContains(t, deps.Optional, fwkplugin.NewDataKey(transferKey, ""))
 	assert.NotContains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(transferKey), ""))
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.WaitingQueueUpdateTimeKey, ""))
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.KVCacheUtilizationUpdateTimeKey, ""))
-	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.KVCacheCapacityUpdateTimeKey, ""))
+	assert.Len(t, deps.Optional, 4)
 }
 
 func TestAdmit(t *testing.T) {
@@ -135,13 +133,20 @@ func TestAdmit(t *testing.T) {
 			wantCode: errcommon.ResourceExhausted,
 		},
 		{
-			name:    "projected request kv does not fit",
+			name:    "request size and capacity do not gate admission",
 			request: request(9000, 2000, 0),
 			endpoints: []fwksched.Endpoint{
 				endpoint("prefill", bylabel.RolePrefill, 0, 0.1, 100000, 0, 0, time.Now()),
 				endpoint("decode", bylabel.RoleDecode, 0, 0.0, 10000, 0, 0, time.Now()),
 			},
-			wantCode: errcommon.ResourceExhausted,
+		},
+		{
+			name:    "missing tokenized request does not gate admission",
+			request: &fwksched.InferenceRequest{Objectives: fwksched.RequestObjectives{Priority: 0}},
+			endpoints: []fwksched.Endpoint{
+				endpoint("prefill", bylabel.RolePrefill, 0, 0.1, 100000, 0, 0, time.Now()),
+				endpoint("decode", bylabel.RoleDecode, 0, 0.1, 0, 0, 0, time.Now()),
+			},
 		},
 		{
 			name: "healthy decode bypasses overloaded peer",
@@ -241,38 +246,6 @@ func TestAdmit(t *testing.T) {
 	}
 }
 
-func TestRequiredKVTokens(t *testing.T) {
-	admitter, err := New("test", DefaultConfig())
-	require.NoError(t, err)
-
-	tests := []struct {
-		name            string
-		request         *fwksched.InferenceRequest
-		want            int64
-		wantTokenizedOK bool
-	}{
-		{name: "requested output", request: request(1000, 1000, 0), want: 2000, wantTokenizedOK: true},
-		{name: "requested output is capped", request: request(1000, 9000, 0), want: 9192, wantTokenizedOK: true},
-		{
-			name: "missing output uses default",
-			request: &fwksched.InferenceRequest{Body: &fwkrh.InferenceRequestBody{
-				TokenizedPrompt: &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{make([]uint32, 1000)}},
-			}},
-			want:            3048,
-			wantTokenizedOK: true,
-		},
-		{name: "missing tokenized prompt", request: &fwksched.InferenceRequest{Body: &fwkrh.InferenceRequestBody{}}, wantTokenizedOK: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, ok := admitter.requiredKVTokens(tt.request)
-			assert.Equal(t, tt.wantTokenizedOK, ok)
-			assert.Equal(t, tt.want, got)
-		})
-	}
-}
-
 func TestAdmitRejectsStaleCustomMetrics(t *testing.T) {
 	config := DefaultConfig()
 	admitter, err := New("test", config)
@@ -350,7 +323,6 @@ func endpoint(name, role string, waiting int, kvUsage float64, kvCapacity int, p
 	attrs.Put(attrmetrics.ScalarMetricUpdateTimeKey(transferKey), attrmetrics.ScalarMetricUpdateTime(updated))
 	attrs.Put(attrmetrics.WaitingQueueUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
 	attrs.Put(attrmetrics.KVCacheUtilizationUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
-	attrs.Put(attrmetrics.KVCacheCapacityUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
 	labels := map[string]string{}
 	if role != "" {
 		labels[bylabel.RoleLabel] = role
@@ -371,7 +343,6 @@ func endpointWithoutCustomMetrics(name, role string, updated time.Time) fwksched
 	attrs := fwkdl.NewAttributes()
 	attrs.Put(attrmetrics.WaitingQueueUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
 	attrs.Put(attrmetrics.KVCacheUtilizationUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
-	attrs.Put(attrmetrics.KVCacheCapacityUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
 	return fwksched.NewEndpoint(
 		&fwkdl.EndpointMetadata{Name: name, Labels: map[string]string{bylabel.RoleLabel: role}},
 		&fwkdl.Metrics{KvCacheMaxTokenCapacity: 100000, UpdateTime: updated},
@@ -398,8 +369,6 @@ func TestDefaultConfigValues(t *testing.T) {
 	assert.Equal(t, "12s", config.MetricsStalenessThreshold)
 	assert.Equal(t, 4, config.Decode.WaitingQueueThreshold)
 	assert.Equal(t, 0.92, config.Decode.KVCacheUtilizationThreshold)
-	assert.Equal(t, int64(2048), config.Decode.DefaultOutputTokens)
-	assert.Equal(t, int64(8192), config.Decode.MaxOutputTokens)
 	assert.Equal(t, SignalConfig{AttributeKey: preallocKey, Threshold: 8}, config.Decode.Prealloc)
 	assert.Equal(t, 4, config.Prefill.WaitingQueueThreshold)
 }
