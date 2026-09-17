@@ -1,0 +1,405 @@
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package pdcapacity implements role-aware admission control for disaggregated
+// prefill and decode deployments.
+package pdcapacity
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	errcommon "github.com/llm-d/llm-d-router/pkg/common/error"
+	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
+	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
+	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
+	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
+	attrmetrics "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/metrics"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
+)
+
+const (
+	PluginType = "pd-capacity-admitter"
+
+	defaultMetricsStalenessThreshold = "12s"
+	defaultDecodeWaitingThreshold    = 4
+	defaultDecodeKVThreshold         = 0.92
+	defaultOutputTokens              = int64(2048)
+	defaultMaxOutputTokens           = int64(8192)
+	defaultPreallocAttributeKey      = "sglang.decode_prealloc_queue_reqs"
+	defaultPreallocThreshold         = 8.0
+	defaultTransferAttributeKey      = "sglang.decode_transfer_queue_reqs"
+	defaultTransferThreshold         = 12.0
+	defaultPrefillWaitingThreshold   = 4
+)
+
+// SignalConfig identifies a scalar endpoint metric and its rejection threshold.
+type SignalConfig struct {
+	AttributeKey string  `json:"attributeKey"`
+	Threshold    float64 `json:"threshold"`
+}
+
+// DecodeConfig configures decode capacity checks.
+type DecodeConfig struct {
+	WaitingQueueThreshold       int          `json:"waitingQueueThreshold"`
+	KVCacheUtilizationThreshold float64      `json:"kvCacheUtilizationThreshold"`
+	DefaultOutputTokens         int64        `json:"defaultOutputTokens"`
+	MaxOutputTokens             int64        `json:"maxOutputTokens"`
+	Prealloc                    SignalConfig `json:"prealloc"`
+	Transfer                    SignalConfig `json:"transfer"`
+}
+
+// PredictedWaitConfig configures token-based prefill wait admission.
+type PredictedWaitConfig struct {
+	InFlightLoadProducerName string  `json:"inFlightLoadProducerName"`
+	PeakTokensPerSecond      float64 `json:"peakTokensPerSecond"`
+	MaxWait                  string  `json:"maxWait"`
+}
+
+// PrefillConfig configures prefill capacity checks.
+type PrefillConfig struct {
+	WaitingQueueThreshold int                  `json:"waitingQueueThreshold"`
+	PredictedWait         *PredictedWaitConfig `json:"predictedWait,omitempty"`
+}
+
+// Config configures the P/D capacity admitter.
+type Config struct {
+	RejectAllPriorities       bool          `json:"rejectAllPriorities"`
+	MetricsStalenessThreshold string        `json:"metricsStalenessThreshold"`
+	Decode                    DecodeConfig  `json:"decode"`
+	Prefill                   PrefillConfig `json:"prefill"`
+}
+
+// DefaultConfig returns the default admission thresholds.
+func DefaultConfig() Config {
+	return Config{
+		MetricsStalenessThreshold: defaultMetricsStalenessThreshold,
+		Decode: DecodeConfig{
+			WaitingQueueThreshold:       defaultDecodeWaitingThreshold,
+			KVCacheUtilizationThreshold: defaultDecodeKVThreshold,
+			DefaultOutputTokens:         defaultOutputTokens,
+			MaxOutputTokens:             defaultMaxOutputTokens,
+			Prealloc: SignalConfig{
+				AttributeKey: defaultPreallocAttributeKey,
+				Threshold:    defaultPreallocThreshold,
+			},
+			Transfer: SignalConfig{
+				AttributeKey: defaultTransferAttributeKey,
+				Threshold:    defaultTransferThreshold,
+			},
+		},
+		Prefill: PrefillConfig{WaitingQueueThreshold: defaultPrefillWaitingThreshold},
+	}
+}
+
+var (
+	_ requestcontrol.Admitter  = &Admitter{}
+	_ fwkplugin.ConsumerPlugin = &Admitter{}
+)
+
+// Admitter rejects requests when no feasible endpoint remains for either P/D role.
+type Admitter struct {
+	typedName                    fwkplugin.TypedName
+	config                       Config
+	metricsStalenessThreshold    time.Duration
+	maxPrefillWait               time.Duration
+	inFlightLoadDataKey          fwkplugin.DataKey
+	uncachedRequestTokensDataKey fwkplugin.DataKey
+}
+
+// Factory creates a P/D capacity admitter from plugin configuration.
+func Factory(name string, rawParameters *json.Decoder, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+	config := DefaultConfig()
+	if rawParameters != nil {
+		if err := rawParameters.Decode(&config); err != nil {
+			return nil, fmt.Errorf("failed to decode %s parameters: %w", PluginType, err)
+		}
+	}
+	return New(name, config)
+}
+
+// New validates config and creates a P/D capacity admitter.
+func New(name string, config Config) (*Admitter, error) {
+	staleness, err := time.ParseDuration(config.MetricsStalenessThreshold)
+	if err != nil || staleness <= 0 {
+		return nil, fmt.Errorf("%s metricsStalenessThreshold must be a positive duration, got %q", PluginType, config.MetricsStalenessThreshold)
+	}
+	if err := validateDecodeConfig(config.Decode); err != nil {
+		return nil, err
+	}
+	if config.Prefill.WaitingQueueThreshold <= 0 {
+		return nil, fmt.Errorf("%s prefill.waitingQueueThreshold must be positive, got %d", PluginType, config.Prefill.WaitingQueueThreshold)
+	}
+
+	maxPrefillWait := time.Duration(0)
+	inFlightProducerName := ""
+	if predicted := config.Prefill.PredictedWait; predicted != nil {
+		if predicted.InFlightLoadProducerName == "" {
+			return nil, fmt.Errorf("%s prefill.predictedWait.inFlightLoadProducerName must be non-empty", PluginType)
+		}
+		if predicted.PeakTokensPerSecond <= 0 {
+			return nil, fmt.Errorf("%s prefill.predictedWait.peakTokensPerSecond must be positive, got %v", PluginType, predicted.PeakTokensPerSecond)
+		}
+		maxPrefillWait, err = time.ParseDuration(predicted.MaxWait)
+		if err != nil || maxPrefillWait <= 0 {
+			return nil, fmt.Errorf("%s prefill.predictedWait.maxWait must be a positive duration, got %q", PluginType, predicted.MaxWait)
+		}
+		inFlightProducerName = predicted.InFlightLoadProducerName
+	}
+
+	if name == "" {
+		name = PluginType
+	}
+	return &Admitter{
+		typedName:                    fwkplugin.TypedName{Type: PluginType, Name: name},
+		config:                       config,
+		metricsStalenessThreshold:    staleness,
+		maxPrefillWait:               maxPrefillWait,
+		inFlightLoadDataKey:          attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(inFlightProducerName),
+		uncachedRequestTokensDataKey: attrconcurrency.UncachedRequestTokensDataKey.WithNonEmptyProducerName(inFlightProducerName),
+	}, nil
+}
+
+func validateDecodeConfig(config DecodeConfig) error {
+	if config.WaitingQueueThreshold <= 0 {
+		return fmt.Errorf("%s decode.waitingQueueThreshold must be positive, got %d", PluginType, config.WaitingQueueThreshold)
+	}
+	if config.KVCacheUtilizationThreshold <= 0 || config.KVCacheUtilizationThreshold > 1 {
+		return fmt.Errorf("%s decode.kvCacheUtilizationThreshold must be in (0, 1], got %v", PluginType, config.KVCacheUtilizationThreshold)
+	}
+	if config.DefaultOutputTokens < 0 || config.DefaultOutputTokens > config.MaxOutputTokens {
+		return fmt.Errorf("%s decode.defaultOutputTokens must be between 0 and maxOutputTokens, got %d", PluginType, config.DefaultOutputTokens)
+	}
+	if config.MaxOutputTokens <= 0 {
+		return fmt.Errorf("%s decode.maxOutputTokens must be positive, got %d", PluginType, config.MaxOutputTokens)
+	}
+	for name, signal := range map[string]SignalConfig{"prealloc": config.Prealloc, "transfer": config.Transfer} {
+		if signal.AttributeKey == "" {
+			return fmt.Errorf("%s decode.%s.attributeKey must be non-empty", PluginType, name)
+		}
+		if signal.Threshold <= 0 {
+			return fmt.Errorf("%s decode.%s.threshold must be positive, got %v", PluginType, name, signal.Threshold)
+		}
+	}
+	return nil
+}
+
+// TypedName returns the plugin type and instance name.
+func (a *Admitter) TypedName() fwkplugin.TypedName {
+	return a.typedName
+}
+
+// Consumes declares request and endpoint data needed by admission checks.
+func (a *Admitter) Consumes() fwkplugin.DataDependencies {
+	required := map[fwkplugin.DataKey]any{
+		tokenizer.TokenizedPromptDataKey: fwkrh.TokenizedPrompt{},
+	}
+	if a.config.Prefill.PredictedWait != nil {
+		required[a.inFlightLoadDataKey] = attrconcurrency.InFlightLoad{}
+		required[a.uncachedRequestTokensDataKey] = attrconcurrency.UncachedRequestTokens{}
+	}
+	return fwkplugin.DataDependencies{
+		Required: required,
+		Optional: map[fwkplugin.DataKey]any{
+			fwkplugin.NewDataKey(a.config.Decode.Prealloc.AttributeKey, ""): attrmetrics.ScalarMetricValue(0),
+			fwkplugin.NewDataKey(a.config.Decode.Transfer.AttributeKey, ""): attrmetrics.ScalarMetricValue(0),
+		},
+	}
+}
+
+// Admit rejects when every endpoint for either required role is unavailable.
+func (a *Admitter) Admit(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) error {
+	if request == nil || (!a.config.RejectAllPriorities && request.Objectives.Priority >= 0) {
+		return nil
+	}
+
+	now := time.Now()
+	prefillTotal, prefillAvailable := 0, 0
+	decodeTotal, decodeAvailable := 0, 0
+	logger := log.FromContext(ctx)
+	for _, endpoint := range endpoints {
+		prefillRole, decodeRole := endpointRoles(endpoint)
+		if prefillRole {
+			prefillTotal++
+			if ok, reason := a.prefillFeasible(endpoint, now); ok {
+				prefillAvailable++
+			} else {
+				logger.V(logutil.DEBUG).Info("P/D capacity admitter excluded prefill endpoint", "endpoint", endpointName(endpoint), "reason", reason)
+			}
+		}
+		if decodeRole {
+			decodeTotal++
+			if ok, reason := a.decodeFeasible(request, endpoint, now); ok {
+				decodeAvailable++
+			} else {
+				logger.V(logutil.DEBUG).Info("P/D capacity admitter excluded decode endpoint", "endpoint", endpointName(endpoint), "reason", reason)
+			}
+		}
+	}
+
+	if prefillAvailable > 0 && decodeAvailable > 0 {
+		return nil
+	}
+
+	reason := "no feasible prefill endpoint"
+	if prefillAvailable > 0 {
+		reason = "no feasible decode endpoint"
+	} else if decodeAvailable == 0 {
+		reason = "no feasible prefill or decode endpoint"
+	}
+	logger.Info("P/D capacity admission rejected request",
+		"reason", reason,
+		"prefillAvailable", prefillAvailable,
+		"prefillTotal", prefillTotal,
+		"decodeAvailable", decodeAvailable,
+		"decodeTotal", decodeTotal)
+	return errcommon.Error{Code: errcommon.ResourceExhausted, Msg: PluginType + ": " + reason}
+}
+
+func (a *Admitter) prefillFeasible(endpoint fwksched.Endpoint, now time.Time) (bool, string) {
+	metrics := endpoint.GetMetrics()
+	if ok, reason := a.metricsFresh(metrics, now); !ok {
+		return false, reason
+	}
+	if metrics.WaitingQueueSize >= a.config.Prefill.WaitingQueueThreshold {
+		return false, "ordinary waiting queue threshold reached"
+	}
+	if a.config.Prefill.PredictedWait == nil {
+		return true, ""
+	}
+
+	rawLoad, ok := endpoint.Get(a.inFlightLoadDataKey.String())
+	if !ok {
+		return false, "missing inflight load"
+	}
+	load, ok := rawLoad.(*attrconcurrency.InFlightLoad)
+	if !ok || load == nil {
+		return false, "invalid inflight load"
+	}
+	rawUncached, ok := endpoint.Get(a.uncachedRequestTokensDataKey.String())
+	if !ok {
+		return false, "missing uncached request tokens"
+	}
+	uncached, ok := rawUncached.(*attrconcurrency.UncachedRequestTokens)
+	if !ok || uncached == nil {
+		return false, "invalid uncached request tokens"
+	}
+	predictedSeconds := float64(load.Tokens+uncached.Tokens) / a.config.Prefill.PredictedWait.PeakTokensPerSecond
+	if predictedSeconds > a.maxPrefillWait.Seconds() {
+		return false, "predicted prefill wait threshold exceeded"
+	}
+	return true, ""
+}
+
+func (a *Admitter) decodeFeasible(request *fwksched.InferenceRequest, endpoint fwksched.Endpoint, now time.Time) (bool, string) {
+	metrics := endpoint.GetMetrics()
+	if ok, reason := a.metricsFresh(metrics, now); !ok {
+		return false, reason
+	}
+	if metrics.WaitingQueueSize >= a.config.Decode.WaitingQueueThreshold {
+		return false, "ordinary waiting queue threshold reached"
+	}
+	if metrics.KVCacheUsagePercent >= a.config.Decode.KVCacheUtilizationThreshold {
+		return false, "KV utilization threshold reached"
+	}
+	prealloc, ok := attrmetrics.ReadScalarMetricValue(endpoint, a.config.Decode.Prealloc.AttributeKey)
+	if !ok {
+		return false, "missing decode preallocation metric"
+	}
+	if float64(prealloc) >= a.config.Decode.Prealloc.Threshold {
+		return false, "decode preallocation threshold reached"
+	}
+	transfer, ok := attrmetrics.ReadScalarMetricValue(endpoint, a.config.Decode.Transfer.AttributeKey)
+	if !ok {
+		return false, "missing decode transfer metric"
+	}
+	if float64(transfer) >= a.config.Decode.Transfer.Threshold {
+		return false, "decode transfer threshold reached"
+	}
+	if metrics.KvCacheMaxTokenCapacity <= 0 {
+		return false, "missing KV token capacity"
+	}
+	requiredTokens, ok := a.requiredKVTokens(request)
+	if !ok {
+		return false, "missing tokenized request"
+	}
+	freeTokens := float64(metrics.KvCacheMaxTokenCapacity) * (1 - metrics.KVCacheUsagePercent)
+	if float64(requiredTokens) > freeTokens {
+		return false, "projected request KV does not fit"
+	}
+	return true, ""
+}
+
+func (a *Admitter) requiredKVTokens(request *fwksched.InferenceRequest) (int64, bool) {
+	if request == nil || request.Body == nil || request.Body.TokenizedPrompt == nil {
+		return 0, false
+	}
+	outputTokens := a.config.Decode.DefaultOutputTokens
+	if requested := request.Body.MaxOutputTokens; requested != nil {
+		outputTokens = max(0, min(*requested, a.config.Decode.MaxOutputTokens))
+	}
+	return int64(request.Body.TokenizedPrompt.TokenCount()) + outputTokens, true
+}
+
+func (a *Admitter) metricsFresh(metrics *fwkdl.Metrics, now time.Time) (bool, string) {
+	if metrics == nil {
+		return false, "missing metrics"
+	}
+	if metrics.UpdateTime.IsZero() {
+		return false, "missing metrics timestamp"
+	}
+	if now.Sub(metrics.UpdateTime) > a.metricsStalenessThreshold {
+		return false, "stale metrics"
+	}
+	return true, ""
+}
+
+func endpointRoles(endpoint fwksched.Endpoint) (bool, bool) {
+	if endpoint == nil || endpoint.GetMetadata() == nil {
+		return false, false
+	}
+	role, ok := endpoint.GetMetadata().Labels[bylabel.RoleLabel]
+	if !ok {
+		return false, false
+	}
+	switch role {
+	case bylabel.RolePrefill:
+		return true, false
+	case bylabel.RoleDecode:
+		return false, true
+	case bylabel.RolePrefillDecode, bylabel.RoleBoth, bylabel.RoleEncodePrefillDecode:
+		return true, true
+	case bylabel.RoleEncodePrefill:
+		return true, false
+	default:
+		return false, false
+	}
+}
+
+func endpointName(endpoint fwksched.Endpoint) string {
+	if endpoint == nil || endpoint.GetMetadata() == nil {
+		return ""
+	}
+	return endpoint.GetMetadata().Name
+}
