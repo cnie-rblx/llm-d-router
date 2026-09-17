@@ -14,10 +14,9 @@ role.
 
 ## Endpoint checks
 
-A prefill endpoint must have fresh metrics and an ordinary waiting queue below
-`prefill.waitingQueueThreshold`. The optional predicted-wait check divides the
-sum of EPP in-flight tokens and the current request's endpoint-specific
-uncached tokens by `peakTokensPerSecond`.
+A prefill endpoint must have a fresh ordinary waiting-queue metric below
+`prefill.waitingQueueThreshold`. Admission deliberately does not use EPP-local
+in-flight token state, so this check remains valid with multiple EPP replicas.
 
 A decode endpoint must have:
 
@@ -44,9 +43,6 @@ plugins:
   parameters:
     sglang:
       url: http://tokenizer:8000
-- type: inflight-load-producer
-  parameters:
-    prefixMatchInfoProducerName: precise-prefix-cache-producer
 - type: pd-capacity-admitter
   parameters:
     rejectAllPriorities: true
@@ -64,10 +60,6 @@ plugins:
         threshold: 12
     prefill:
       waitingQueueThreshold: 4
-      predictedWait:
-        inFlightLoadProducerName: inflight-load-producer
-        peakTokensPerSecond: 8000
-        maxWait: 3s
 ```
 
 The custom queue attributes must be populated by the metrics extractor:
@@ -93,9 +85,6 @@ The custom queue attributes must be populated by the metrics extractor:
 `rejectAllPriorities: false` limits rejection to requests with negative
 priority. Set it to `true` when overload protection must also apply to ordinary
 priority-zero traffic.
-
-Omit `prefill.predictedWait` to enforce only prefill metric freshness and the
-ordinary prefill queue threshold.
 
 ## Flow-control ordering
 

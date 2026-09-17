@@ -32,7 +32,6 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
-	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 	attrmetrics "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/metrics"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
@@ -56,8 +55,6 @@ func TestFactoryValidation(t *testing.T) {
 		{name: "empty prealloc key", parameters: `{"decode":{"prealloc":{"attributeKey":""}}}`, wantErr: "prealloc.attributeKey"},
 		{name: "zero transfer threshold", parameters: `{"decode":{"transfer":{"threshold":0}}}`, wantErr: "transfer.threshold"},
 		{name: "default output over maximum", parameters: `{"decode":{"defaultOutputTokens":9,"maxOutputTokens":8}}`, wantErr: "defaultOutputTokens"},
-		{name: "bad predicted wait", parameters: `{"prefill":{"predictedWait":{"inFlightLoadProducerName":"inflight-load-producer","peakTokensPerSecond":8000,"maxWait":"bad"}}}`, wantErr: "maxWait"},
-		{name: "zero predicted throughput", parameters: `{"prefill":{"predictedWait":{"inFlightLoadProducerName":"inflight-load-producer","peakTokensPerSecond":0,"maxWait":"3s"}}}`, wantErr: "peakTokensPerSecond"},
 	}
 
 	for _, tt := range tests {
@@ -74,12 +71,13 @@ func TestFactoryValidation(t *testing.T) {
 	}
 }
 
-func TestConsumesPredictedWaitDependencies(t *testing.T) {
+func TestConsumesDependencies(t *testing.T) {
 	config := DefaultConfig()
-	without, err := New("test", config)
+	admitter, err := New("test", config)
 	require.NoError(t, err)
-	deps := without.Consumes()
+	deps := admitter.Consumes()
 	assert.Contains(t, deps.Required, tokenizer.TokenizedPromptDataKey)
+	assert.Len(t, deps.Required, 1)
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(preallocKey, ""))
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(transferKey, ""))
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(preallocKey), ""))
@@ -87,17 +85,6 @@ func TestConsumesPredictedWaitDependencies(t *testing.T) {
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.WaitingQueueUpdateTimeKey, ""))
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.KVCacheUtilizationUpdateTimeKey, ""))
 	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.KVCacheCapacityUpdateTimeKey, ""))
-
-	config.Prefill.PredictedWait = &PredictedWaitConfig{
-		InFlightLoadProducerName: "custom-inflight",
-		PeakTokensPerSecond:      8000,
-		MaxWait:                  "3s",
-	}
-	with, err := New("test", config)
-	require.NoError(t, err)
-	deps = with.Consumes()
-	assert.Contains(t, deps.Required, with.inFlightLoadDataKey)
-	assert.Contains(t, deps.Required, with.uncachedRequestTokensDataKey)
 }
 
 func TestAdmit(t *testing.T) {
@@ -288,29 +275,6 @@ func TestRequiredKVTokens(t *testing.T) {
 	}
 }
 
-func TestAdmitPredictedPrefillWait(t *testing.T) {
-	config := DefaultConfig()
-	config.RejectAllPriorities = true
-	config.Prefill.PredictedWait = &PredictedWaitConfig{
-		InFlightLoadProducerName: "inflight-load-producer",
-		PeakTokensPerSecond:      8000,
-		MaxWait:                  "3s",
-	}
-	admitter, err := New("test", config)
-	require.NoError(t, err)
-
-	prefill := endpoint("prefill", bylabel.RolePrefill, 0, 0.1, 100000, 0, 0, time.Now())
-	prefill.Put(admitter.inFlightLoadDataKey.String(), &attrconcurrency.InFlightLoad{Tokens: 24000})
-	prefill.Put(admitter.uncachedRequestTokensDataKey.String(), &attrconcurrency.UncachedRequestTokens{Tokens: 1})
-	decode := endpoint("decode", bylabel.RoleDecode, 0, 0.1, 100000, 0, 0, time.Now())
-
-	err = admitter.Admit(context.Background(), request(1000, 1000, 0), []fwksched.Endpoint{prefill, decode})
-	require.Error(t, err)
-	var typed errcommon.Error
-	require.ErrorAs(t, err, &typed)
-	assert.Equal(t, errcommon.ResourceExhausted, typed.Code)
-}
-
 func TestAdmitRejectsStaleCustomMetrics(t *testing.T) {
 	config := DefaultConfig()
 	admitter, err := New("test", config)
@@ -441,7 +405,6 @@ func TestDefaultConfigValues(t *testing.T) {
 	assert.Equal(t, SignalConfig{AttributeKey: preallocKey, Threshold: 8}, config.Decode.Prealloc)
 	assert.Equal(t, SignalConfig{AttributeKey: transferKey, Threshold: 12}, config.Decode.Transfer)
 	assert.Equal(t, 4, config.Prefill.WaitingQueueThreshold)
-	assert.Nil(t, config.Prefill.PredictedWait)
 }
 
 func ExampleConfig() {

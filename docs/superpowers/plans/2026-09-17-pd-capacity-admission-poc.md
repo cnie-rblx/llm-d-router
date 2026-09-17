@@ -62,7 +62,7 @@ Run `git add pkg/epp/requestcontrol/director.go pkg/epp/requestcontrol/director_
 
 **Interfaces:**
 - Produces: plugin type `pd-capacity-admitter` implementing `requestcontrol.Admitter` and `plugin.ConsumerPlugin`.
-- Consumes: core endpoint metrics, configured scalar custom-metric attributes, tokenized prompt data, and optionally `InFlightLoad` plus `UncachedRequestTokens` from a named inflight-load producer.
+- Consumes: core endpoint metrics, configured scalar custom-metric attributes, and tokenized prompt data.
 
 - [ ] **Step 1: Write failing factory and dependency tests**
 
@@ -92,17 +92,13 @@ decode:
     threshold: 12
 prefill:
   waitingQueueThreshold: 4
-  predictedWait:
-    inFlightLoadProducerName: inflight-load-producer
-    peakTokensPerSecond: 8000
-    maxWait: 3s
 ```
 
-The `predictedWait` block is optional. When omitted, prefill admission uses freshness and ordinary waiting only.
+Prefill admission uses engine-observed ordinary waiting only. It does not use EPP-local in-flight state.
 
 - [ ] **Step 4: Write failing behavior tests**
 
-Cover one feasible rank per role; all-decode prealloc, transfer, ordinary-waiting, KV-utilization, and projected-KV rejection; one healthy decode bypassing overloaded peers; all-prefill ordinary-waiting rejection; optional predicted-prefill-wait rejection; stale/zero/missing metrics; missing custom metrics; hybrid roles; unlabeled roles; priority bypass; and typed `ResourceExhausted` denials.
+Cover one feasible rank per role; all-decode prealloc, transfer, ordinary-waiting, KV-utilization, and projected-KV rejection; one healthy decode bypassing overloaded peers; all-prefill ordinary-waiting rejection; stale/zero/missing metrics; missing custom metrics; hybrid roles; unlabeled roles; priority bypass; and typed `ResourceExhausted` denials.
 
 - [ ] **Step 5: Run tests and confirm RED**
 
@@ -120,11 +116,7 @@ requiredKVTokens = TokenizedPrompt.TokenCount() + outputReserve
 
 Require fresh metrics, queue values below thresholds, KV usage below threshold, positive KV capacity, and `requiredKVTokens <= freeKVTokens`.
 
-Prefill feasibility requires fresh metrics and ordinary waiting below threshold. When `predictedWait` is configured, also require:
-
-```text
-(InFlightLoad.Tokens + UncachedRequestTokens.Tokens) / peakTokensPerSecond <= maxWait
-```
+Prefill feasibility requires a fresh engine-reported ordinary waiting queue below threshold. EPP-local in-flight token state is intentionally excluded so admission remains replica-independent.
 
 Return typed `ResourceExhausted` only when no feasible endpoint exists for at least one role. Emit one operational rejection log plus debug endpoint-unavailability logs without request payloads.
 

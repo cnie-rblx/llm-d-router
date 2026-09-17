@@ -32,7 +32,6 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
-	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 	attrmetrics "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/metrics"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requestcontrol/dataproducer/tokenizer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/scheduling/filter/bylabel"
@@ -70,17 +69,9 @@ type DecodeConfig struct {
 	Transfer                    SignalConfig `json:"transfer"`
 }
 
-// PredictedWaitConfig configures token-based prefill wait admission.
-type PredictedWaitConfig struct {
-	InFlightLoadProducerName string  `json:"inFlightLoadProducerName"`
-	PeakTokensPerSecond      float64 `json:"peakTokensPerSecond"`
-	MaxWait                  string  `json:"maxWait"`
-}
-
 // PrefillConfig configures prefill capacity checks.
 type PrefillConfig struct {
-	WaitingQueueThreshold int                  `json:"waitingQueueThreshold"`
-	PredictedWait         *PredictedWaitConfig `json:"predictedWait,omitempty"`
+	WaitingQueueThreshold int `json:"waitingQueueThreshold"`
 }
 
 // Config configures the P/D capacity admitter.
@@ -121,12 +112,9 @@ var (
 
 // Admitter rejects requests when no feasible endpoint remains for either P/D role.
 type Admitter struct {
-	typedName                    fwkplugin.TypedName
-	config                       Config
-	metricsStalenessThreshold    time.Duration
-	maxPrefillWait               time.Duration
-	inFlightLoadDataKey          fwkplugin.DataKey
-	uncachedRequestTokensDataKey fwkplugin.DataKey
+	typedName                 fwkplugin.TypedName
+	config                    Config
+	metricsStalenessThreshold time.Duration
 }
 
 // Factory creates a P/D capacity admitter from plugin configuration.
@@ -153,32 +141,13 @@ func New(name string, config Config) (*Admitter, error) {
 		return nil, fmt.Errorf("%s prefill.waitingQueueThreshold must be positive, got %d", PluginType, config.Prefill.WaitingQueueThreshold)
 	}
 
-	maxPrefillWait := time.Duration(0)
-	inFlightProducerName := ""
-	if predicted := config.Prefill.PredictedWait; predicted != nil {
-		if predicted.InFlightLoadProducerName == "" {
-			return nil, fmt.Errorf("%s prefill.predictedWait.inFlightLoadProducerName must be non-empty", PluginType)
-		}
-		if predicted.PeakTokensPerSecond <= 0 {
-			return nil, fmt.Errorf("%s prefill.predictedWait.peakTokensPerSecond must be positive, got %v", PluginType, predicted.PeakTokensPerSecond)
-		}
-		maxPrefillWait, err = time.ParseDuration(predicted.MaxWait)
-		if err != nil || maxPrefillWait <= 0 {
-			return nil, fmt.Errorf("%s prefill.predictedWait.maxWait must be a positive duration, got %q", PluginType, predicted.MaxWait)
-		}
-		inFlightProducerName = predicted.InFlightLoadProducerName
-	}
-
 	if name == "" {
 		name = PluginType
 	}
 	return &Admitter{
-		typedName:                    fwkplugin.TypedName{Type: PluginType, Name: name},
-		config:                       config,
-		metricsStalenessThreshold:    staleness,
-		maxPrefillWait:               maxPrefillWait,
-		inFlightLoadDataKey:          attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(inFlightProducerName),
-		uncachedRequestTokensDataKey: attrconcurrency.UncachedRequestTokensDataKey.WithNonEmptyProducerName(inFlightProducerName),
+		typedName:                 fwkplugin.TypedName{Type: PluginType, Name: name},
+		config:                    config,
+		metricsStalenessThreshold: staleness,
 	}, nil
 }
 
@@ -215,10 +184,6 @@ func (a *Admitter) TypedName() fwkplugin.TypedName {
 func (a *Admitter) Consumes() fwkplugin.DataDependencies {
 	required := map[fwkplugin.DataKey]any{
 		tokenizer.TokenizedPromptDataKey: fwkrh.TokenizedPrompt{},
-	}
-	if a.config.Prefill.PredictedWait != nil {
-		required[a.inFlightLoadDataKey] = attrconcurrency.InFlightLoad{}
-		required[a.uncachedRequestTokensDataKey] = attrconcurrency.UncachedRequestTokens{}
 	}
 	optional := map[fwkplugin.DataKey]any{
 		fwkplugin.NewDataKey(a.config.Decode.Prealloc.AttributeKey, ""):                                        attrmetrics.ScalarMetricValue(0),
@@ -294,30 +259,6 @@ func (a *Admitter) prefillFeasible(endpoint fwksched.Endpoint, now time.Time) (b
 	}
 	if metrics.WaitingQueueSize >= a.config.Prefill.WaitingQueueThreshold {
 		return false, "ordinary waiting queue threshold reached"
-	}
-	if a.config.Prefill.PredictedWait == nil {
-		return true, ""
-	}
-
-	rawLoad, ok := endpoint.Get(a.inFlightLoadDataKey.String())
-	if !ok {
-		return false, "missing inflight load"
-	}
-	load, ok := rawLoad.(*attrconcurrency.InFlightLoad)
-	if !ok || load == nil {
-		return false, "invalid inflight load"
-	}
-	rawUncached, ok := endpoint.Get(a.uncachedRequestTokensDataKey.String())
-	if !ok {
-		return false, "missing uncached request tokens"
-	}
-	uncached, ok := rawUncached.(*attrconcurrency.UncachedRequestTokens)
-	if !ok || uncached == nil {
-		return false, "invalid uncached request tokens"
-	}
-	predictedSeconds := float64(load.Tokens+uncached.Tokens) / a.config.Prefill.PredictedWait.PeakTokensPerSecond
-	if predictedSeconds > a.maxPrefillWait.Seconds() {
-		return false, "predicted prefill wait threshold exceeded"
 	}
 	return true, ""
 }
