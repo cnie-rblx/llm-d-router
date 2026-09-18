@@ -493,6 +493,24 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				engineKeys[i] = kvblock.BlockHash(hash)
 			}
 
+			// SGLang-native hashing: lookup keys ARE the engine hashes. The
+			// parent SHA256 digest is not recoverable from the truncated
+			// parent_block_hash, so recomputing request keys from this page's
+			// tokens would disagree with the worker. Index the published
+			// hashes directly and skip the parent-mapping gate.
+			if p.tokenProcessor.IndexesEngineHashes() {
+				if len(engineKeys) == 0 {
+					continue
+				}
+				if err := p.index.Add(ctx, engineKeys, engineKeys, podEntries); err != nil {
+					debugLogger.Error(err, "Failed to add event to index",
+						"podIdentifier", podIdentifier, "event", ev)
+					continue
+				}
+				p.dedup.trackStore(storeScope, ev.BlockHashes)
+				continue
+			}
+
 			parentRequestKey := kvblock.EmptyBlockHash
 			if ev.ParentHash != 0 {
 				parentEngineKey := kvblock.BlockHash(ev.ParentHash)

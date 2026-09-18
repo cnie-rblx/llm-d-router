@@ -1353,6 +1353,52 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 	return m.GetCounter().GetValue()
 }
 
+func newSGLangNativePool(t *testing.T) (*Pool, kvblock.Index, kvblock.TokenProcessor) {
+	t.Helper()
+	idx, err := kvblock.NewInMemoryIndex(kvblock.DefaultInMemoryIndexConfig())
+	require.NoError(t, err)
+	tp, err := kvblock.NewTokenProcessor(&kvblock.TokenProcessorConfig{
+		BlockSizeTokens: 4,
+		HashAlgo:        kvblock.HashAlgoSGLang,
+		Bigram:          true,
+	})
+	require.NoError(t, err)
+	pool := NewPool(DefaultConfig(), idx, tp, nil)
+	return pool, idx, tp
+}
+
+func TestSGLangNativeHash_IndexesEngineHashesWithoutParent(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tp := newSGLangNativePool(t)
+	wrapped := &recordingIndex{Index: idx}
+	pool.index = wrapped
+
+	golden := int64(-2735951481331064195)
+	childHash := uint64(golden)
+	batch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes: []uint64{childHash},
+				Tokens:      []uint32{10, 20, 30, 40},
+				ParentHash:  999, // missing on purpose
+				BlockSize:   4,
+			},
+		},
+	}
+	pool.processEventBatch(ctx, batch, "pod-native", "test-model")
+
+	assert.Zero(t, wrapped.getRequestKeyCalls, "native ingest must not consult the parent mapping")
+
+	keys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, []uint32{10, 20, 30, 40}, "", nil)
+	require.NoError(t, err)
+	require.Equal(t, []kvblock.BlockHash{kvblock.BlockHash(childHash)}, keys)
+
+	result, err := idx.Lookup(ctx, keys, nil)
+	require.NoError(t, err)
+	require.Len(t, result[keys[0]], 1)
+	assert.Equal(t, "pod-native", result[keys[0]][0].PodIdentifier)
+}
+
 func TestEffectiveReplayPort(t *testing.T) {
 	tests := []struct {
 		name       string

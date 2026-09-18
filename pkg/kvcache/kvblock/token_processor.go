@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"strings"
 
 	"github.com/fxamacker/cbor/v2"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -45,8 +46,25 @@ type TokenProcessorConfig struct {
 	// The system's deployer is responsible for aligning the vLLM deployments
 	// with the same seed value.
 	HashSeed string `json:"hashSeed"`
+	// HashAlgo selects the request-side block hash. "vllm" (default) is FNV-64a
+	// over canonical CBOR, matching vLLM prefix caching. "sglang" is SHA256
+	// chained on the parent page's full 32-byte digest, matching SGLang's
+	// radix_cache / sgl-router hash.rs. With "sglang", KV-event ingest indexes
+	// BlockStored.block_hashes directly and does not recompute keys from tokens.
+	HashAlgo string `json:"hashAlgo,omitempty"`
+	// Bigram enables EAGLE overlapping-pair hashing. Only valid with HashAlgo
+	// "sglang". Must match the worker's is_eagle / is_bigram flag or lookups
+	// silently miss.
+	Bigram   bool   `json:"bigram,omitempty"`
 	initHash uint64 // cache once
 }
+
+const (
+	// HashAlgoVLLM is vLLM-compatible FNV-64a hashing (the default).
+	HashAlgoVLLM = "vllm"
+	// HashAlgoSGLang is SGLang radix_cache SHA256 hashing.
+	HashAlgoSGLang = "sglang"
+)
 
 // DefaultTokenProcessorConfig returns the default configuration for the token processor.
 func DefaultTokenProcessorConfig() *TokenProcessorConfig {
@@ -72,6 +90,11 @@ type TokenProcessor interface {
 
 	// BlockSize returns the number of tokens per block used by this processor.
 	BlockSize() int
+
+	// IndexesEngineHashes reports whether KV-event ingest should use
+	// BlockStored.block_hashes as lookup keys (identity mapping) instead of
+	// recomputing request keys from event tokens and a parent mapping.
+	IndexesEngineHashes() bool
 }
 
 // chunkedTokenDatabase is a concrete implementation of TokenDatabase.
@@ -82,6 +105,22 @@ type chunkedTokenDatabase struct {
 }
 
 var _ TokenProcessor = &chunkedTokenDatabase{}
+
+// NewTokenProcessor builds the TokenProcessor selected by HashAlgo.
+func NewTokenProcessor(config *TokenProcessorConfig) (TokenProcessor, error) {
+	var cfg TokenProcessorConfig
+	if config != nil {
+		cfg = *config
+	}
+	switch strings.ToLower(cfg.HashAlgo) {
+	case "", HashAlgoVLLM:
+		return NewChunkedTokenDatabase(config)
+	case HashAlgoSGLang:
+		return NewSGLangTokenProcessor(config)
+	default:
+		return nil, fmt.Errorf("unsupported hashAlgo %q (want %q or %q)", cfg.HashAlgo, HashAlgoVLLM, HashAlgoSGLang)
+	}
+}
 
 // NewChunkedTokenDatabase creates a new instance with the given config and metadata.
 func NewChunkedTokenDatabase(config *TokenProcessorConfig) (TokenProcessor, error) {
@@ -178,6 +217,11 @@ func (db *chunkedTokenDatabase) prefixHashes(
 // BlockSize returns the number of tokens per block.
 func (db *chunkedTokenDatabase) BlockSize() int {
 	return db.BlockSizeTokens
+}
+
+// IndexesEngineHashes reports that vLLM-compatible ingest recomputes request keys.
+func (db *chunkedTokenDatabase) IndexesEngineHashes() bool {
+	return false
 }
 
 // chunkTokens splits the input slice of tokens into chunks of size blockSize.

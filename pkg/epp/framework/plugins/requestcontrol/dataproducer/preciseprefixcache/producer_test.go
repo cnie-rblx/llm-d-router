@@ -693,6 +693,7 @@ func TestNew_BlockSizeFlowsViaTokenProcessor(t *testing.T) {
 		//nolint:staticcheck // SA1019: exercising backward-compat path on purpose.
 		{name: "blockSize only (deprecated)", cfg: &kvblock.TokenProcessorConfig{BlockSize: 64}, want: 64},
 		{name: "blockSizeTokens only", cfg: &kvblock.TokenProcessorConfig{BlockSizeTokens: 64}, want: 64},
+		{name: "sglang hashAlgo", cfg: &kvblock.TokenProcessorConfig{BlockSizeTokens: 64, HashAlgo: kvblock.HashAlgoSGLang, Bigram: true}, want: 64},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

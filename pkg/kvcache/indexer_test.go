@@ -46,6 +46,10 @@ func (m *mockTokenProcessor) BlockSize() int {
 	return 16
 }
 
+func (m *mockTokenProcessor) IndexesEngineHashes() bool {
+	return false
+}
+
 const (
 	testModel = "test-model"
 	testPodA  = "pod-a"
