@@ -105,6 +105,7 @@ func TestInvalidMetricsDoNotAdmit(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			a, err := New(t.Name(), DefaultConfig())
 			require.NoError(t, err)
+			markObserved(a)
 			require.Error(t, a.Admit(context.Background(), request(1, 1, 0), tt.pool))
 		})
 	}

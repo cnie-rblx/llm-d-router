@@ -119,6 +119,11 @@ type Admitter struct {
 	metricsStalenessThreshold time.Duration
 	mu                        sync.Mutex
 	open                      bool
+	// A role that has never reported a usable sample cannot veto admission.
+	// Without this the breaker opens on every process start, before the
+	// metrics data source has completed its first poll.
+	warmedPrefill bool
+	warmedDecode  bool
 }
 
 // Factory creates a P/D capacity admitter from plugin configuration.
@@ -230,14 +235,18 @@ func (a *Admitter) AdmitPool(ctx context.Context, request *fwksched.InferenceReq
 	endpoints := snapshot()
 
 	now := time.Now()
-	prefillTotal, prefillAvailable := 0, 0
-	decodeTotal, decodeAvailable := 0, 0
+	prefillTotal, prefillAvailable, prefillObservable := 0, 0, 0
+	decodeTotal, decodeAvailable, decodeObservable := 0, 0, 0
 	logger := log.FromContext(ctx)
 	for _, endpoint := range endpoints {
 		prefillRole, decodeRole := endpointRoles(endpoint)
 		if prefillRole {
 			prefillTotal++
-			if ok, reason := a.prefillFeasible(endpoint, now, a.open); ok {
+			ok, observable, reason := a.prefillFeasible(endpoint, now, a.open)
+			if observable {
+				prefillObservable++
+			}
+			if ok {
 				prefillAvailable++
 			} else {
 				logger.V(logutil.DEBUG).Info("P/D capacity admitter excluded prefill endpoint", "endpoint", endpointName(endpoint), "reason", reason)
@@ -245,12 +254,33 @@ func (a *Admitter) AdmitPool(ctx context.Context, request *fwksched.InferenceReq
 		}
 		if decodeRole {
 			decodeTotal++
-			if ok, reason := a.decodeFeasible(endpoint, now, a.open); ok {
+			ok, observable, reason := a.decodeFeasible(endpoint, now, a.open)
+			if observable {
+				decodeObservable++
+			}
+			if ok {
 				decodeAvailable++
 			} else {
 				logger.V(logutil.DEBUG).Info("P/D capacity admitter excluded decode endpoint", "endpoint", endpointName(endpoint), "reason", reason)
 			}
 		}
+	}
+
+	// Freshness checks only become authoritative once a role has been seen at
+	// least once. Before that, absent samples mean "not scraped yet", not
+	// "endpoint unhealthy", so they must not reject traffic.
+	if prefillObservable > 0 {
+		a.warmedPrefill = true
+	}
+	if decodeObservable > 0 {
+		a.warmedDecode = true
+	}
+	prefillJudged, decodeJudged := a.warmedPrefill, a.warmedDecode
+	if !prefillJudged || !decodeJudged {
+		logger.V(logutil.DEBUG).Info("P/D capacity admitter still warming up",
+			"prefillObserved", prefillJudged, "decodeObserved", decodeJudged,
+			"prefillTotal", prefillTotal, "decodeTotal", decodeTotal)
+		return nil
 	}
 
 	if prefillAvailable > 0 && decodeAvailable > 0 {
@@ -277,22 +307,26 @@ func (a *Admitter) AdmitPool(ctx context.Context, request *fwksched.InferenceReq
 	return errcommon.Error{Code: errcommon.ResourceExhausted, Msg: PluginType + ": " + reason}
 }
 
-func (a *Admitter) prefillFeasible(endpoint fwksched.Endpoint, now time.Time, recovering bool) (bool, string) {
+// prefillFeasible reports whether the endpoint can take work, whether its
+// metrics were readable at all, and why it was excluded.
+func (a *Admitter) prefillFeasible(endpoint fwksched.Endpoint, now time.Time, recovering bool) (bool, bool, string) {
 	waiting, ok := a.readFreshSample(endpoint, attrmetrics.WaitingQueueSampleKey, now)
 	if !ok {
-		return false, "missing, stale or invalid ordinary waiting queue metric"
+		return false, false, "missing, stale or invalid ordinary waiting queue metric"
 	}
 	threshold := a.config.Prefill.WaitingQueueThreshold
 	if recovering {
 		threshold = a.config.Prefill.WaitingQueueRecoveryThreshold
 	}
 	if waiting >= float64(threshold) {
-		return false, "ordinary waiting queue threshold reached"
+		return false, true, "ordinary waiting queue threshold reached"
 	}
-	return true, ""
+	return true, true, ""
 }
 
-func (a *Admitter) decodeFeasible(endpoint fwksched.Endpoint, now time.Time, recovering bool) (bool, string) {
+// decodeFeasible reports whether the endpoint can take work, whether all of
+// its required metrics were readable, and why it was excluded.
+func (a *Admitter) decodeFeasible(endpoint fwksched.Endpoint, now time.Time, recovering bool) (bool, bool, string) {
 	waitingThreshold := a.config.Decode.WaitingQueueThreshold
 	kvThreshold := a.config.Decode.KVCacheUtilizationThreshold
 	preallocThreshold := a.config.Decode.Prealloc.Threshold
@@ -303,26 +337,28 @@ func (a *Admitter) decodeFeasible(endpoint fwksched.Endpoint, now time.Time, rec
 	}
 	waiting, ok := a.readFreshSample(endpoint, attrmetrics.WaitingQueueSampleKey, now)
 	if !ok {
-		return false, "missing, stale or invalid ordinary waiting queue metric"
+		return false, false, "missing, stale or invalid ordinary waiting queue metric"
 	}
+	kv, kvOK := a.readFreshSample(endpoint, attrmetrics.KVCacheUtilizationSampleKey, now)
+	prealloc, preallocOK := a.readFreshSample(endpoint, attrmetrics.ScalarMetricSampleKey(a.config.Decode.Prealloc.AttributeKey), now)
+	observable := kvOK && kv <= 1 && preallocOK
+
 	if waiting >= float64(waitingThreshold) {
-		return false, "ordinary waiting queue threshold reached"
+		return false, observable, "ordinary waiting queue threshold reached"
 	}
-	kv, ok := a.readFreshSample(endpoint, attrmetrics.KVCacheUtilizationSampleKey, now)
-	if !ok || kv > 1 {
-		return false, "missing, stale or invalid KV utilization metric"
+	if !kvOK || kv > 1 {
+		return false, false, "missing, stale or invalid KV utilization metric"
 	}
 	if kv >= kvThreshold {
-		return false, "KV utilization threshold reached"
+		return false, observable, "KV utilization threshold reached"
 	}
-	prealloc, ok := a.readFreshSample(endpoint, attrmetrics.ScalarMetricSampleKey(a.config.Decode.Prealloc.AttributeKey), now)
-	if !ok {
-		return false, "missing, stale or invalid decode preallocation metric"
+	if !preallocOK {
+		return false, false, "missing, stale or invalid decode preallocation metric"
 	}
 	if prealloc >= preallocThreshold {
-		return false, "decode preallocation threshold reached"
+		return false, observable, "decode preallocation threshold reached"
 	}
-	return true, ""
+	return true, true, ""
 }
 
 func (a *Admitter) readFreshSample(endpoint fwksched.Endpoint, key string, now time.Time) (float64, bool) {

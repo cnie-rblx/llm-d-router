@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -226,6 +227,7 @@ func TestAdmit(t *testing.T) {
 			}
 			admitter, err := New("test", config)
 			require.NoError(t, err)
+			markObserved(admitter)
 
 			req := tt.request
 			if req == nil {
@@ -244,10 +246,70 @@ func TestAdmit(t *testing.T) {
 	}
 }
 
+// markObserved simulates a completed first metrics poll for both roles so a
+// test exercises steady-state behaviour rather than cold start.
+func markObserved(a *Admitter) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.warmedPrefill = true
+	a.warmedDecode = true
+}
+
+func TestAdmitDuringMetricsWarmupDoesNotReject(t *testing.T) {
+	ctx, req := context.Background(), request(1000, 1000, 0)
+	tests := []struct {
+		name      string
+		endpoints []fwksched.Endpoint
+	}{
+		{"no endpoints discovered yet", nil},
+		{"no samples published yet", []fwksched.Endpoint{
+			endpointWithoutCoreMetrics("prefill", bylabel.RolePrefill),
+			endpointWithoutCoreMetrics("decode", bylabel.RoleDecode),
+		}},
+		{"only prefill samples published", []fwksched.Endpoint{
+			endpoint("prefill", bylabel.RolePrefill, 0, 0.1, 100000, 0, 0, time.Now()),
+			endpointWithoutCoreMetrics("decode", bylabel.RoleDecode),
+		}},
+		{"only decode samples published", []fwksched.Endpoint{
+			endpointWithoutCoreMetrics("prefill", bylabel.RolePrefill),
+			endpoint("decode", bylabel.RoleDecode, 0, 0.1, 100000, 0, 0, time.Now()),
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, err := New(t.Name(), DefaultConfig())
+			require.NoError(t, err)
+			require.NoError(t, a.Admit(ctx, req, tt.endpoints), "an unscraped role must not veto admission")
+			require.Equal(t, float64(0), testutil.ToFloat64(breakerOpen.WithLabelValues(t.Name())))
+		})
+	}
+}
+
+func TestAdmitFailsClosedOnceSamplesHaveBeenObserved(t *testing.T) {
+	a, err := New(t.Name(), DefaultConfig())
+	require.NoError(t, err)
+	ctx, req := context.Background(), request(1000, 1000, 0)
+
+	healthy := []fwksched.Endpoint{
+		endpoint("prefill", bylabel.RolePrefill, 0, 0.1, 100000, 0, 0, time.Now()),
+		endpoint("decode", bylabel.RoleDecode, 0, 0.1, 100000, 0, 0, time.Now()),
+	}
+	require.NoError(t, a.Admit(ctx, req, healthy))
+
+	// The data layer has now been seen, so losing it is a real fault.
+	vanished := []fwksched.Endpoint{
+		endpoint("prefill", bylabel.RolePrefill, 0, 0.1, 100000, 0, 0, time.Now()),
+		endpointWithoutCoreMetrics("decode", bylabel.RoleDecode),
+	}
+	require.Error(t, a.Admit(ctx, req, vanished))
+	require.Error(t, a.Admit(ctx, req, nil), "an empty pool still opens the breaker after warmup")
+}
+
 func TestAdmitRejectsStaleCustomMetrics(t *testing.T) {
 	config := DefaultConfig()
 	admitter, err := New("test", config)
 	require.NoError(t, err)
+	markObserved(admitter)
 
 	prefill := endpoint("prefill", bylabel.RolePrefill, 0, 0.1, 100000, 0, 0, time.Now())
 	decode := endpoint("decode", bylabel.RoleDecode, 0, 0.1, 100000, 0, 0, time.Now())
@@ -264,6 +326,7 @@ func TestAdmitRejectsStaleCustomMetrics(t *testing.T) {
 func TestAdmitRejectsStaleCoreMetricDespiteFreshSharedTimestamp(t *testing.T) {
 	admitter, err := New("test", DefaultConfig())
 	require.NoError(t, err)
+	markObserved(admitter)
 
 	prefill := endpoint("prefill", bylabel.RolePrefill, 0, 0.1, 100000, 0, 0, time.Now())
 	decode := endpoint("decode", bylabel.RoleDecode, 0, 0.1, 100000, 0, 0, time.Now())

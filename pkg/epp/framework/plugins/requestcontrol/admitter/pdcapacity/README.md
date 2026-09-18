@@ -52,6 +52,13 @@ samples, NaN/infinite values, negative queues, and KV utilization outside [0, 1]
 make the affected endpoint unavailable for both admission and recovery. A missing
 metric retains its last sample until it exceeds `metricsStalenessThreshold`.
 
+That fail-closed rule applies only after a role has been observed at least once.
+EPP starts serving before the metrics data source completes its first poll, so
+until one prefill and one decode endpoint have published a usable sample, the
+unobserved role cannot veto admission and the breaker stays closed. Each role
+latches as observed for the process lifetime, so losing a data layer that
+previously worked still rejects.
+
 Evaluation continues on requests while open; no background loop or half-open
 probe is required. Each EPP replica keeps its own state, which resets to closed
 on restart. There are no endpoint reservations or cross-replica state guarantees.
