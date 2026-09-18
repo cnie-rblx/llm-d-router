@@ -108,7 +108,7 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 			errs = append(errs, err)
 		} else {
 			clone.WaitingQueueSize = int(extractValue(metric))
-			ep.GetAttributes().Put(attrmetrics.WaitingQueueUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(observedAt))
+			ep.GetAttributes().Put(attrmetrics.WaitingQueueSampleKey, attrmetrics.MetricSample{Value: extractValue(metric), UpdatedAt: observedAt})
 			updated = true
 		}
 	}
@@ -127,7 +127,7 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 			errs = append(errs, err)
 		} else {
 			clone.KVCacheUsagePercent = extractValue(metric)
-			ep.GetAttributes().Put(attrmetrics.KVCacheUtilizationUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(observedAt))
+			ep.GetAttributes().Put(attrmetrics.KVCacheUtilizationSampleKey, attrmetrics.MetricSample{Value: clone.KVCacheUsagePercent, UpdatedAt: observedAt})
 			updated = true
 		}
 	}
@@ -182,7 +182,7 @@ func (ext *Extractor) Extract(ctx context.Context, in fwkdl.PollInput[sourcemetr
 			continue
 		}
 		ep.GetAttributes().Put(custom.AttributeKey, attrmetrics.ScalarMetricValue(extractValue(metric)))
-		ep.GetAttributes().Put(attrmetrics.ScalarMetricUpdateTimeKey(custom.AttributeKey), attrmetrics.ScalarMetricUpdateTime(observedAt))
+		ep.GetAttributes().Put(attrmetrics.ScalarMetricSampleKey(custom.AttributeKey), attrmetrics.MetricSample{Value: extractValue(metric), UpdatedAt: observedAt})
 		updated = true
 	}
 

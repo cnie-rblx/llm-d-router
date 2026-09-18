@@ -75,13 +75,11 @@ func TestConsumesDependencies(t *testing.T) {
 	require.NoError(t, err)
 	deps := admitter.Consumes()
 	assert.Empty(t, deps.Required)
-	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(preallocKey, ""))
-	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(preallocKey), ""))
+	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.ScalarMetricSampleKey(preallocKey), ""))
 	assert.NotContains(t, deps.Optional, fwkplugin.NewDataKey(transferKey, ""))
-	assert.NotContains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(transferKey), ""))
-	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.WaitingQueueUpdateTimeKey, ""))
-	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.KVCacheUtilizationUpdateTimeKey, ""))
-	assert.Len(t, deps.Optional, 4)
+	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.WaitingQueueSampleKey, ""))
+	assert.Contains(t, deps.Optional, fwkplugin.NewDataKey(attrmetrics.KVCacheUtilizationSampleKey, ""))
+	assert.Len(t, deps.Optional, 3)
 }
 
 func TestAdmit(t *testing.T) {
@@ -253,8 +251,8 @@ func TestAdmitRejectsStaleCustomMetrics(t *testing.T) {
 
 	prefill := endpoint("prefill", bylabel.RolePrefill, 0, 0.1, 100000, 0, 0, time.Now())
 	decode := endpoint("decode", bylabel.RoleDecode, 0, 0.1, 100000, 0, 0, time.Now())
-	decode.Put(attrmetrics.ScalarMetricUpdateTimeKey(preallocKey),
-		attrmetrics.ScalarMetricUpdateTime(time.Now().Add(-time.Minute)))
+	decode.Put(attrmetrics.ScalarMetricSampleKey(preallocKey),
+		attrmetrics.MetricSample{Value: 0, UpdatedAt: time.Now().Add(-time.Minute)})
 
 	err = admitter.Admit(context.Background(), request(1000, 1000, 0), []fwksched.Endpoint{prefill, decode})
 	require.Error(t, err)
@@ -270,8 +268,8 @@ func TestAdmitRejectsStaleCoreMetricDespiteFreshSharedTimestamp(t *testing.T) {
 	prefill := endpoint("prefill", bylabel.RolePrefill, 0, 0.1, 100000, 0, 0, time.Now())
 	decode := endpoint("decode", bylabel.RoleDecode, 0, 0.1, 100000, 0, 0, time.Now())
 	decode.GetMetrics().UpdateTime = time.Now()
-	decode.Put(attrmetrics.WaitingQueueUpdateTimeKey,
-		attrmetrics.CoreMetricUpdateTime(time.Now().Add(-time.Minute)))
+	decode.Put(attrmetrics.WaitingQueueSampleKey,
+		attrmetrics.MetricSample{Value: 0, UpdatedAt: time.Now().Add(-time.Minute)})
 
 	err = admitter.Admit(context.Background(), request(1000, 1000, 0), []fwksched.Endpoint{prefill, decode})
 	require.Error(t, err)
@@ -317,12 +315,11 @@ func request(promptTokens int, maxOutputTokens int64, priority int) *fwksched.In
 
 func endpoint(name, role string, waiting int, kvUsage float64, kvCapacity int, prealloc, transfer float64, updated time.Time) fwksched.Endpoint {
 	attrs := fwkdl.NewAttributes()
+	attrs.Put(attrmetrics.WaitingQueueSampleKey, attrmetrics.MetricSample{Value: float64(waiting), UpdatedAt: updated})
+	attrs.Put(attrmetrics.KVCacheUtilizationSampleKey, attrmetrics.MetricSample{Value: kvUsage, UpdatedAt: updated})
+	attrs.Put(attrmetrics.ScalarMetricSampleKey(preallocKey), attrmetrics.MetricSample{Value: prealloc, UpdatedAt: updated})
 	attrs.Put(preallocKey, attrmetrics.ScalarMetricValue(prealloc))
 	attrs.Put(transferKey, attrmetrics.ScalarMetricValue(transfer))
-	attrs.Put(attrmetrics.ScalarMetricUpdateTimeKey(preallocKey), attrmetrics.ScalarMetricUpdateTime(updated))
-	attrs.Put(attrmetrics.ScalarMetricUpdateTimeKey(transferKey), attrmetrics.ScalarMetricUpdateTime(updated))
-	attrs.Put(attrmetrics.WaitingQueueUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
-	attrs.Put(attrmetrics.KVCacheUtilizationUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
 	labels := map[string]string{}
 	if role != "" {
 		labels[bylabel.RoleLabel] = role
@@ -341,8 +338,8 @@ func endpoint(name, role string, waiting int, kvUsage float64, kvCapacity int, p
 
 func endpointWithoutCustomMetrics(name, role string, updated time.Time) fwksched.Endpoint {
 	attrs := fwkdl.NewAttributes()
-	attrs.Put(attrmetrics.WaitingQueueUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
-	attrs.Put(attrmetrics.KVCacheUtilizationUpdateTimeKey, attrmetrics.CoreMetricUpdateTime(updated))
+	attrs.Put(attrmetrics.WaitingQueueSampleKey, attrmetrics.MetricSample{Value: 0, UpdatedAt: updated})
+	attrs.Put(attrmetrics.KVCacheUtilizationSampleKey, attrmetrics.MetricSample{Value: 0, UpdatedAt: updated})
 	return fwksched.NewEndpoint(
 		&fwkdl.EndpointMetadata{Name: name, Labels: map[string]string{bylabel.RoleLabel: role}},
 		&fwkdl.Metrics{KvCacheMaxTokenCapacity: 100000, UpdateTime: updated},
@@ -354,8 +351,6 @@ func endpointWithoutCoreMetrics(name, role string) fwksched.Endpoint {
 	attrs := fwkdl.NewAttributes()
 	attrs.Put(preallocKey, attrmetrics.ScalarMetricValue(0))
 	attrs.Put(transferKey, attrmetrics.ScalarMetricValue(0))
-	attrs.Put(attrmetrics.ScalarMetricUpdateTimeKey(preallocKey), attrmetrics.ScalarMetricUpdateTime(time.Now()))
-	attrs.Put(attrmetrics.ScalarMetricUpdateTimeKey(transferKey), attrmetrics.ScalarMetricUpdateTime(time.Now()))
 	return fwksched.NewEndpoint(
 		&fwkdl.EndpointMetadata{Name: name, Labels: map[string]string{bylabel.RoleLabel: role}},
 		nil,
@@ -369,7 +364,10 @@ func TestDefaultConfigValues(t *testing.T) {
 	assert.Equal(t, "12s", config.MetricsStalenessThreshold)
 	assert.Equal(t, 4, config.Decode.WaitingQueueThreshold)
 	assert.Equal(t, 0.92, config.Decode.KVCacheUtilizationThreshold)
-	assert.Equal(t, SignalConfig{AttributeKey: preallocKey, Threshold: 8}, config.Decode.Prealloc)
+	assert.Equal(t, SignalConfig{AttributeKey: preallocKey, Threshold: 8, RecoveryThreshold: 4}, config.Decode.Prealloc)
+	assert.Equal(t, 2, config.Decode.WaitingQueueRecoveryThreshold)
+	assert.Equal(t, .85, config.Decode.KVCacheUtilizationRecoveryThreshold)
+	assert.Equal(t, 2, config.Prefill.WaitingQueueRecoveryThreshold)
 	assert.Equal(t, 4, config.Prefill.WaitingQueueThreshold)
 }
 

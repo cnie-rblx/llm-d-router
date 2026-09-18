@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a role-aware admission plugin that returns HTTP 429 when every eligible prefill or decode rank is unavailable according to fresh queue, KV, and request-cost signals.
+**Goal:** Add a deployment-wide hysteretic admission plugin that returns HTTP 429 when every prefill or decode endpoint is unavailable according to fresh queue and KV signals.
 
-**Architecture:** Keep the pre-tokenization flow-control queue unchanged and implement resource admission at the post-data-producer `Admitter` extension point. The plugin partitions the combined endpoint set by `llm-d.ai/role`, evaluates each rank independently, and admits only when at least one prefill and one decode rank are feasible. Raw request bytes remain a queue-memory guard rather than an inference-cost estimate.
+**Architecture:** Keep the pre-tokenization flow-control queue unchanged and implement resource admission at the post-data-producer `Admitter` extension point. A `PoolScopedAdmitter` receives a lazy full-pool snapshot callback, leaving ordinary admitters and scheduling on their request-filtered candidates. The plugin evaluates role-specific thresholds but retains one pool-wide open/closed state per EPP plugin instance. Metric values and observation times are immutable samples. Raw request bytes remain a queue-memory guard rather than an inference-cost estimate.
 
 **Tech Stack:** Go, llm-d EPP plugin framework, SGLang endpoint metrics, controller-runtime logging, testify.
 
@@ -13,12 +13,22 @@
 - Work only in `/home/coder/llm-d-router-decode-prealloc-admission-control` on branch `lfeng/decode-prealloc-admission-control`.
 - Follow test-driven development: every production behavior must first have a focused failing test.
 - Do not modify existing scheduling filters or scorers.
-- Evaluate explicitly labeled P/D endpoint roles from the combined candidate set.
+- Evaluate explicitly labeled P/D endpoint roles from the full protected pool, independently of request candidate subsets.
 - Admit only when at least one prefill-capable and one decode-capable endpoint are feasible.
 - Missing, zero-timestamp, or stale endpoint metrics make that endpoint unavailable.
-- Metrics freshness and all queue, KV, and request-cost thresholds are configurable.
+- Metrics freshness and queue/KV trip and recovery thresholds are configurable.
 - Preserve typed `ResourceExhausted` admission denials as HTTP 429; all other denial errors retain HTTP 500 behavior.
 - Do not deploy, build an image, push, or perform public actions.
+
+---
+
+## Hysteresis Iteration
+
+1. Add immutable per-signal value/time samples in the metrics attribute and extractor packages. Verify extraction, partial scrape retention, invalid values, and interleaved publication before changing admission to consume them.
+2. Add the optional full-pool admission interface and Director dispatch. Verify request subsets remain in scheduling and ordinary admission, while the pool callback reads all protected endpoints lazily.
+3. Retain one synchronized breaker state. Preserve trip thresholds; recover strictly below prefill/decode waiting 2, preallocation 4, and KV 0.85 by default. Verify transition sequences, bounds, stale/invalid samples, priority bypass, and concurrent snapshot/state access.
+4. Add a state gauge and transition logs; document initialization, replica-local state, request-driven recovery, and unchanged empty-candidate behavior.
+5. Run focused extraction, admission, Director, and runner tests, concurrency tests with `-race`, and changed-code lint. Keep changes local; no push or public PR edits.
 
 ---
 
@@ -143,7 +153,7 @@ Register `pdcapacity.PluginType` with `fwkplugin.StabilityAlpha` beside the exis
 
 - [ ] **Step 4: Document behavior and configuration**
 
-Document that the plugin is top-level, stateless per metrics snapshot, treats missing/stale data as endpoint-unavailable, and runs after data producers. Document that an enabled earlier flow-control gate can queue requests before this plugin executes.
+Document that the plugin is top-level, retains one pool-wide breaker state, treats missing/stale/invalid samples as endpoint-unavailable, and runs after data producers. Document recovery thresholds, replica-local state, the state gauge, and that an enabled earlier flow-control gate can queue requests before this plugin executes.
 
 - [ ] **Step 5: Run registration and focused tests**
 

@@ -23,51 +23,29 @@ import (
 )
 
 const (
-	scalarMetricUpdateTimeSuffix = ".updateTime"
-	// WaitingQueueUpdateTimeKey identifies the waiting-queue scrape timestamp.
-	WaitingQueueUpdateTimeKey = "core-metrics.waiting-queue.updateTime"
-	// KVCacheUtilizationUpdateTimeKey identifies the KV-utilization scrape timestamp.
-	KVCacheUtilizationUpdateTimeKey = "core-metrics.kv-cache-utilization.updateTime"
+	WaitingQueueSampleKey       = "core-metrics.waiting-queue.sample"
+	KVCacheUtilizationSampleKey = "core-metrics.kv-cache-utilization.sample"
 )
 
 // ScalarMetricValue is a numeric endpoint attribute extracted from a configured scalar metric.
 type ScalarMetricValue float64
 
-func (v ScalarMetricValue) Clone() fwkdl.Cloneable {
-	return v
-}
+func (v ScalarMetricValue) Clone() fwkdl.Cloneable { return v }
 
 func ReadScalarMetricValue(attrs fwkdl.AttributeMap, key string) (ScalarMetricValue, bool) {
 	return fwkdl.ReadAttribute[ScalarMetricValue](attrs, key)
 }
 
-// ScalarMetricUpdateTime records when a scalar endpoint metric was extracted.
-type ScalarMetricUpdateTime time.Time
-
-func (v ScalarMetricUpdateTime) Clone() fwkdl.Cloneable {
-	return v
+// MetricSample keeps one signal's value and observation time in a single immutable attribute.
+type MetricSample struct {
+	Value     float64
+	UpdatedAt time.Time
 }
 
-// ScalarMetricUpdateTimeKey returns the companion timestamp key for a scalar metric.
-func ScalarMetricUpdateTimeKey(key string) string {
-	return key + scalarMetricUpdateTimeSuffix
-}
+func (s MetricSample) Clone() fwkdl.Cloneable { return s }
 
-// ReadScalarMetricUpdateTime reads the companion timestamp for a scalar metric.
-func ReadScalarMetricUpdateTime(attrs fwkdl.AttributeMap, key string) (time.Time, bool) {
-	value, ok := fwkdl.ReadAttribute[ScalarMetricUpdateTime](attrs, ScalarMetricUpdateTimeKey(key))
-	return time.Time(value), ok
-}
+func ScalarMetricSampleKey(key string) string { return key + ".sample" }
 
-// CoreMetricUpdateTime records when one core endpoint metric was extracted.
-type CoreMetricUpdateTime time.Time
-
-func (v CoreMetricUpdateTime) Clone() fwkdl.Cloneable {
-	return v
-}
-
-// ReadCoreMetricUpdateTime reads a core endpoint metric timestamp.
-func ReadCoreMetricUpdateTime(attrs fwkdl.AttributeMap, key string) (time.Time, bool) {
-	value, ok := fwkdl.ReadAttribute[CoreMetricUpdateTime](attrs, key)
-	return time.Time(value), ok
+func ReadMetricSample(attrs fwkdl.AttributeMap, key string) (MetricSample, bool) {
+	return fwkdl.ReadAttribute[MetricSample](attrs, key)
 }

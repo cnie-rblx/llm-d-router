@@ -165,12 +165,12 @@ func TestMetricsExtractionDefaultConfig(t *testing.T) {
 	assert.Equal(t, 16, m.CacheBlockSize, "CacheBlockSize")
 	assert.Equal(t, 512, m.CacheNumBlocks, "CacheNumBlocks")
 	for _, key := range []string{
-		attrmetrics.WaitingQueueUpdateTimeKey,
-		attrmetrics.KVCacheUtilizationUpdateTimeKey,
+		attrmetrics.WaitingQueueSampleKey,
+		attrmetrics.KVCacheUtilizationSampleKey,
 	} {
-		updatedAt, ok := attrmetrics.ReadCoreMetricUpdateTime(ep.GetAttributes(), key)
+		updatedAt, ok := attrmetrics.ReadMetricSample(ep.GetAttributes(), key)
 		require.True(t, ok, "%s should have an update timestamp", key)
-		assert.False(t, updatedAt.IsZero())
+		assert.False(t, updatedAt.UpdatedAt.IsZero())
 	}
 }
 
@@ -389,9 +389,9 @@ func TestMetricsExtractionCustomScalarFromConfig(t *testing.T) {
 	got, ok := attrmetrics.ReadScalarMetricValue(ep.GetAttributes(), attributeKey)
 	require.True(t, ok, "custom scalar metric should be stored as an endpoint attribute")
 	assert.InDelta(t, 42.5, float64(got), 0.001)
-	updatedAt, ok := attrmetrics.ReadScalarMetricUpdateTime(ep.GetAttributes(), attributeKey)
+	updatedAt, ok := attrmetrics.ReadMetricSample(ep.GetAttributes(), attrmetrics.ScalarMetricSampleKey(attributeKey))
 	require.True(t, ok, "custom scalar metric should record its update time")
-	assert.False(t, updatedAt.IsZero())
+	assert.False(t, updatedAt.UpdatedAt.IsZero())
 	assert.Zero(t, ep.GetMetrics().WaitingQueueSize)
 	assert.Zero(t, ep.GetMetrics().RunningRequestsSize)
 	assert.Zero(t, ep.GetMetrics().KVCacheUsagePercent)
@@ -433,14 +433,14 @@ func TestMetricsExtractionMissingCustomScalarKeepsItsPreviousUpdateTime(t *testi
 		"custom_queue_depth": gauge(2),
 		"custom_heartbeat":   gauge(1),
 	})))
-	queueUpdatedAt, ok := attrmetrics.ReadScalarMetricUpdateTime(ep.GetAttributes(), queueKey)
+	queueUpdatedAt, ok := attrmetrics.ReadMetricSample(ep.GetAttributes(), attrmetrics.ScalarMetricSampleKey(queueKey))
 	require.True(t, ok)
 
 	err := ext.Extract(context.Background(), input(sourcemetrics.PrometheusMetricMap{
 		"custom_heartbeat": gauge(2),
 	}))
 	require.ErrorContains(t, err, "custom_queue_depth")
-	afterMissingScrape, ok := attrmetrics.ReadScalarMetricUpdateTime(ep.GetAttributes(), queueKey)
+	afterMissingScrape, ok := attrmetrics.ReadMetricSample(ep.GetAttributes(), attrmetrics.ScalarMetricSampleKey(queueKey))
 	require.True(t, ok)
 	assert.Equal(t, queueUpdatedAt, afterMissingScrape,
 		"a successful update of another metric must not refresh the missing metric")
@@ -475,14 +475,14 @@ func TestMetricsExtractionMissingCoreMetricKeepsItsPreviousUpdateTime(t *testing
 		"custom_queue_depth": gauge(2),
 		"custom_running":     gauge(1),
 	})))
-	queueUpdatedAt, ok := attrmetrics.ReadCoreMetricUpdateTime(ep.GetAttributes(), attrmetrics.WaitingQueueUpdateTimeKey)
+	queueUpdatedAt, ok := attrmetrics.ReadMetricSample(ep.GetAttributes(), attrmetrics.WaitingQueueSampleKey)
 	require.True(t, ok)
 
 	err := ext.Extract(context.Background(), input(sourcemetrics.PrometheusMetricMap{
 		"custom_running": gauge(2),
 	}))
 	require.ErrorContains(t, err, "custom_queue_depth")
-	afterMissingScrape, ok := attrmetrics.ReadCoreMetricUpdateTime(ep.GetAttributes(), attrmetrics.WaitingQueueUpdateTimeKey)
+	afterMissingScrape, ok := attrmetrics.ReadMetricSample(ep.GetAttributes(), attrmetrics.WaitingQueueSampleKey)
 	require.True(t, ok)
 	assert.Equal(t, queueUpdatedAt, afterMissingScrape,
 		"a successful update of another core metric must not refresh the missing metric")

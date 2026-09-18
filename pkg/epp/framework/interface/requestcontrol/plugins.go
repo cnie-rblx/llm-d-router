@@ -113,6 +113,14 @@ type Admitter interface {
 	Admit(ctx context.Context, request *fwksched.InferenceRequest, pods []fwksched.Endpoint) error
 }
 
+// PoolScopedAdmitter evaluates the full protected pool rather than request-filtered
+// candidates. The lazy snapshot allows stateful plugins to capture metrics under
+// their state lock. Scheduling and ordinary admitters retain request-specific candidates.
+type PoolScopedAdmitter interface {
+	Admitter
+	AdmitPool(ctx context.Context, request *fwksched.InferenceRequest, snapshot func() []fwksched.Endpoint) error
+}
+
 // RequestHeaderProcessor runs after InferenceRequest creation but before admission control.
 // It processes request metadata (headers, path, method) to attach attributes to the request
 // via request.PutAttribute().

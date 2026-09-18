@@ -22,6 +22,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"sync"
 	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -49,15 +51,18 @@ const (
 
 // SignalConfig identifies a scalar endpoint metric and its rejection threshold.
 type SignalConfig struct {
-	AttributeKey string  `json:"attributeKey"`
-	Threshold    float64 `json:"threshold"`
+	AttributeKey      string  `json:"attributeKey"`
+	Threshold         float64 `json:"threshold"`
+	RecoveryThreshold float64 `json:"recoveryThreshold"`
 }
 
 // DecodeConfig configures decode capacity checks.
 type DecodeConfig struct {
-	WaitingQueueThreshold       int          `json:"waitingQueueThreshold"`
-	KVCacheUtilizationThreshold float64      `json:"kvCacheUtilizationThreshold"`
-	Prealloc                    SignalConfig `json:"prealloc"`
+	WaitingQueueThreshold               int          `json:"waitingQueueThreshold"`
+	KVCacheUtilizationThreshold         float64      `json:"kvCacheUtilizationThreshold"`
+	WaitingQueueRecoveryThreshold       int          `json:"waitingQueueRecoveryThreshold"`
+	KVCacheUtilizationRecoveryThreshold float64      `json:"kvCacheUtilizationRecoveryThreshold"`
+	Prealloc                            SignalConfig `json:"prealloc"`
 	// Deprecated: retained only so existing strict-decoded configurations remain valid.
 	// Output-token reservations are not used for admission decisions.
 	DefaultOutputTokens int64 `json:"defaultOutputTokens"`
@@ -69,7 +74,8 @@ type DecodeConfig struct {
 
 // PrefillConfig configures prefill capacity checks.
 type PrefillConfig struct {
-	WaitingQueueThreshold int `json:"waitingQueueThreshold"`
+	WaitingQueueThreshold         int `json:"waitingQueueThreshold"`
+	WaitingQueueRecoveryThreshold int `json:"waitingQueueRecoveryThreshold"`
 }
 
 // Config configures the P/D capacity admitter.
@@ -86,20 +92,24 @@ func DefaultConfig() Config {
 		RejectAllPriorities:       true,
 		MetricsStalenessThreshold: defaultMetricsStalenessThreshold,
 		Decode: DecodeConfig{
-			WaitingQueueThreshold:       defaultDecodeWaitingThreshold,
-			KVCacheUtilizationThreshold: defaultDecodeKVThreshold,
+			WaitingQueueThreshold:               defaultDecodeWaitingThreshold,
+			KVCacheUtilizationThreshold:         defaultDecodeKVThreshold,
+			WaitingQueueRecoveryThreshold:       2,
+			KVCacheUtilizationRecoveryThreshold: 0.85,
 			Prealloc: SignalConfig{
-				AttributeKey: defaultPreallocAttributeKey,
-				Threshold:    defaultPreallocThreshold,
+				AttributeKey:      defaultPreallocAttributeKey,
+				Threshold:         defaultPreallocThreshold,
+				RecoveryThreshold: 4,
 			},
 		},
-		Prefill: PrefillConfig{WaitingQueueThreshold: defaultPrefillWaitingThreshold},
+		Prefill: PrefillConfig{WaitingQueueThreshold: defaultPrefillWaitingThreshold, WaitingQueueRecoveryThreshold: 2},
 	}
 }
 
 var (
-	_ requestcontrol.Admitter  = &Admitter{}
-	_ fwkplugin.ConsumerPlugin = &Admitter{}
+	_ requestcontrol.Admitter           = &Admitter{}
+	_ requestcontrol.PoolScopedAdmitter = &Admitter{}
+	_ fwkplugin.ConsumerPlugin          = &Admitter{}
 )
 
 // Admitter rejects requests when no feasible endpoint remains for either P/D role.
@@ -107,6 +117,8 @@ type Admitter struct {
 	typedName                 fwkplugin.TypedName
 	config                    Config
 	metricsStalenessThreshold time.Duration
+	mu                        sync.Mutex
+	open                      bool
 }
 
 // Factory creates a P/D capacity admitter from plugin configuration.
@@ -132,10 +144,15 @@ func New(name string, config Config) (*Admitter, error) {
 	if config.Prefill.WaitingQueueThreshold <= 0 {
 		return nil, fmt.Errorf("%s prefill.waitingQueueThreshold must be positive, got %d", PluginType, config.Prefill.WaitingQueueThreshold)
 	}
+	if err := validateRecovery("prefill.waitingQueueRecoveryThreshold", float64(config.Prefill.WaitingQueueRecoveryThreshold), float64(config.Prefill.WaitingQueueThreshold)); err != nil {
+		return nil, err
+	}
 
 	if name == "" {
 		name = PluginType
 	}
+	registerMetrics()
+	breakerOpen.WithLabelValues(name).Set(0)
 	return &Admitter{
 		typedName:                 fwkplugin.TypedName{Type: PluginType, Name: name},
 		config:                    config,
@@ -147,17 +164,38 @@ func validateDecodeConfig(config DecodeConfig) error {
 	if config.WaitingQueueThreshold <= 0 {
 		return fmt.Errorf("%s decode.waitingQueueThreshold must be positive, got %d", PluginType, config.WaitingQueueThreshold)
 	}
-	if config.KVCacheUtilizationThreshold <= 0 || config.KVCacheUtilizationThreshold > 1 {
+	if !finite(config.KVCacheUtilizationThreshold) || config.KVCacheUtilizationThreshold <= 0 || config.KVCacheUtilizationThreshold > 1 {
 		return fmt.Errorf("%s decode.kvCacheUtilizationThreshold must be in (0, 1], got %v", PluginType, config.KVCacheUtilizationThreshold)
 	}
 	if config.Prealloc.AttributeKey == "" {
 		return fmt.Errorf("%s decode.prealloc.attributeKey must be non-empty", PluginType)
 	}
-	if config.Prealloc.Threshold <= 0 {
+	if !finite(config.Prealloc.Threshold) || config.Prealloc.Threshold <= 0 {
 		return fmt.Errorf("%s decode.prealloc.threshold must be positive, got %v", PluginType, config.Prealloc.Threshold)
+	}
+	for _, threshold := range []struct {
+		name           string
+		recovery, trip float64
+	}{
+		{"decode.waitingQueueRecoveryThreshold", float64(config.WaitingQueueRecoveryThreshold), float64(config.WaitingQueueThreshold)},
+		{"decode.kvCacheUtilizationRecoveryThreshold", config.KVCacheUtilizationRecoveryThreshold, config.KVCacheUtilizationThreshold},
+		{"decode.prealloc.recoveryThreshold", config.Prealloc.RecoveryThreshold, config.Prealloc.Threshold},
+	} {
+		if err := validateRecovery(threshold.name, threshold.recovery, threshold.trip); err != nil {
+			return err
+		}
 	}
 	return nil
 }
+
+func validateRecovery(name string, recovery, trip float64) error {
+	if !finite(recovery) || recovery <= 0 || recovery >= trip {
+		return fmt.Errorf("%s %s must be positive and less than its trip threshold, got %v", PluginType, name, recovery)
+	}
+	return nil
+}
+
+func finite(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value, 0) }
 
 // TypedName returns the plugin type and instance name.
 func (a *Admitter) TypedName() fwkplugin.TypedName {
@@ -167,10 +205,9 @@ func (a *Admitter) TypedName() fwkplugin.TypedName {
 // Consumes declares endpoint data needed by admission checks.
 func (a *Admitter) Consumes() fwkplugin.DataDependencies {
 	optional := map[fwkplugin.DataKey]any{
-		fwkplugin.NewDataKey(a.config.Decode.Prealloc.AttributeKey, ""):                                        attrmetrics.ScalarMetricValue(0),
-		fwkplugin.NewDataKey(attrmetrics.ScalarMetricUpdateTimeKey(a.config.Decode.Prealloc.AttributeKey), ""): attrmetrics.ScalarMetricUpdateTime{},
-		fwkplugin.NewDataKey(attrmetrics.WaitingQueueUpdateTimeKey, ""):                                        attrmetrics.CoreMetricUpdateTime{},
-		fwkplugin.NewDataKey(attrmetrics.KVCacheUtilizationUpdateTimeKey, ""):                                  attrmetrics.CoreMetricUpdateTime{},
+		fwkplugin.NewDataKey(attrmetrics.ScalarMetricSampleKey(a.config.Decode.Prealloc.AttributeKey), ""): attrmetrics.MetricSample{},
+		fwkplugin.NewDataKey(attrmetrics.WaitingQueueSampleKey, ""):                                        attrmetrics.MetricSample{},
+		fwkplugin.NewDataKey(attrmetrics.KVCacheUtilizationSampleKey, ""):                                  attrmetrics.MetricSample{},
 	}
 	return fwkplugin.DataDependencies{
 		Optional: optional,
@@ -179,9 +216,18 @@ func (a *Admitter) Consumes() fwkplugin.DataDependencies {
 
 // Admit rejects when every endpoint for either required role is unavailable.
 func (a *Admitter) Admit(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) error {
+	return a.AdmitPool(ctx, request, func() []fwksched.Endpoint { return endpoints })
+}
+
+// AdmitPool evaluates the full protected pool, independently of scheduling subsets.
+func (a *Admitter) AdmitPool(ctx context.Context, request *fwksched.InferenceRequest, snapshot func() []fwksched.Endpoint) error {
 	if request == nil || (!a.config.RejectAllPriorities && request.Objectives.Priority >= 0) {
 		return nil
 	}
+	// Capture metrics under the state lock so queued callers do not replay older snapshots.
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	endpoints := snapshot()
 
 	now := time.Now()
 	prefillTotal, prefillAvailable := 0, 0
@@ -191,7 +237,7 @@ func (a *Admitter) Admit(ctx context.Context, request *fwksched.InferenceRequest
 		prefillRole, decodeRole := endpointRoles(endpoint)
 		if prefillRole {
 			prefillTotal++
-			if ok, reason := a.prefillFeasible(endpoint, now); ok {
+			if ok, reason := a.prefillFeasible(endpoint, now, a.open); ok {
 				prefillAvailable++
 			} else {
 				logger.V(logutil.DEBUG).Info("P/D capacity admitter excluded prefill endpoint", "endpoint", endpointName(endpoint), "reason", reason)
@@ -199,7 +245,7 @@ func (a *Admitter) Admit(ctx context.Context, request *fwksched.InferenceRequest
 		}
 		if decodeRole {
 			decodeTotal++
-			if ok, reason := a.decodeFeasible(endpoint, now); ok {
+			if ok, reason := a.decodeFeasible(endpoint, now, a.open); ok {
 				decodeAvailable++
 			} else {
 				logger.V(logutil.DEBUG).Info("P/D capacity admitter excluded decode endpoint", "endpoint", endpointName(endpoint), "reason", reason)
@@ -208,6 +254,7 @@ func (a *Admitter) Admit(ctx context.Context, request *fwksched.InferenceRequest
 	}
 
 	if prefillAvailable > 0 && decodeAvailable > 0 {
+		a.setOpen(ctx, false, "prefill and decode recovery thresholds satisfied")
 		return nil
 	}
 
@@ -217,6 +264,10 @@ func (a *Admitter) Admit(ctx context.Context, request *fwksched.InferenceRequest
 	} else if decodeAvailable == 0 {
 		reason = "no feasible prefill or decode endpoint"
 	}
+	if a.open {
+		reason = "recovery pending: " + reason
+	}
+	a.setOpen(ctx, true, reason)
 	logger.Info("P/D capacity admission rejected request",
 		"reason", reason,
 		"prefillAvailable", prefillAvailable,
@@ -226,62 +277,58 @@ func (a *Admitter) Admit(ctx context.Context, request *fwksched.InferenceRequest
 	return errcommon.Error{Code: errcommon.ResourceExhausted, Msg: PluginType + ": " + reason}
 }
 
-func (a *Admitter) prefillFeasible(endpoint fwksched.Endpoint, now time.Time) (bool, string) {
-	metrics := endpoint.GetMetrics()
-	if metrics == nil {
-		return false, "missing metrics"
+func (a *Admitter) prefillFeasible(endpoint fwksched.Endpoint, now time.Time, recovering bool) (bool, string) {
+	waiting, ok := a.readFreshSample(endpoint, attrmetrics.WaitingQueueSampleKey, now)
+	if !ok {
+		return false, "missing, stale or invalid ordinary waiting queue metric"
 	}
-	if !a.coreMetricFresh(endpoint, attrmetrics.WaitingQueueUpdateTimeKey, now) {
-		return false, "missing or stale ordinary waiting queue metric"
+	threshold := a.config.Prefill.WaitingQueueThreshold
+	if recovering {
+		threshold = a.config.Prefill.WaitingQueueRecoveryThreshold
 	}
-	if metrics.WaitingQueueSize >= a.config.Prefill.WaitingQueueThreshold {
+	if waiting >= float64(threshold) {
 		return false, "ordinary waiting queue threshold reached"
 	}
 	return true, ""
 }
 
-func (a *Admitter) decodeFeasible(endpoint fwksched.Endpoint, now time.Time) (bool, string) {
-	metrics := endpoint.GetMetrics()
-	if metrics == nil {
-		return false, "missing metrics"
+func (a *Admitter) decodeFeasible(endpoint fwksched.Endpoint, now time.Time, recovering bool) (bool, string) {
+	waitingThreshold := a.config.Decode.WaitingQueueThreshold
+	kvThreshold := a.config.Decode.KVCacheUtilizationThreshold
+	preallocThreshold := a.config.Decode.Prealloc.Threshold
+	if recovering {
+		waitingThreshold = a.config.Decode.WaitingQueueRecoveryThreshold
+		kvThreshold = a.config.Decode.KVCacheUtilizationRecoveryThreshold
+		preallocThreshold = a.config.Decode.Prealloc.RecoveryThreshold
 	}
-	if !a.coreMetricFresh(endpoint, attrmetrics.WaitingQueueUpdateTimeKey, now) {
-		return false, "missing or stale ordinary waiting queue metric"
+	waiting, ok := a.readFreshSample(endpoint, attrmetrics.WaitingQueueSampleKey, now)
+	if !ok {
+		return false, "missing, stale or invalid ordinary waiting queue metric"
 	}
-	if metrics.WaitingQueueSize >= a.config.Decode.WaitingQueueThreshold {
+	if waiting >= float64(waitingThreshold) {
 		return false, "ordinary waiting queue threshold reached"
 	}
-	if !a.coreMetricFresh(endpoint, attrmetrics.KVCacheUtilizationUpdateTimeKey, now) {
-		return false, "missing or stale KV utilization metric"
+	kv, ok := a.readFreshSample(endpoint, attrmetrics.KVCacheUtilizationSampleKey, now)
+	if !ok || kv > 1 {
+		return false, "missing, stale or invalid KV utilization metric"
 	}
-	if metrics.KVCacheUsagePercent >= a.config.Decode.KVCacheUtilizationThreshold {
+	if kv >= kvThreshold {
 		return false, "KV utilization threshold reached"
 	}
-	prealloc, ok := a.readFreshSignal(endpoint, a.config.Decode.Prealloc.AttributeKey, now)
+	prealloc, ok := a.readFreshSample(endpoint, attrmetrics.ScalarMetricSampleKey(a.config.Decode.Prealloc.AttributeKey), now)
 	if !ok {
-		return false, "missing or stale decode preallocation metric"
+		return false, "missing, stale or invalid decode preallocation metric"
 	}
-	if float64(prealloc) >= a.config.Decode.Prealloc.Threshold {
+	if prealloc >= preallocThreshold {
 		return false, "decode preallocation threshold reached"
 	}
 	return true, ""
 }
 
-func (a *Admitter) coreMetricFresh(endpoint fwksched.Endpoint, key string, now time.Time) bool {
-	updatedAt, ok := attrmetrics.ReadCoreMetricUpdateTime(endpoint, key)
-	return ok && !updatedAt.IsZero() && now.Sub(updatedAt) <= a.metricsStalenessThreshold
-}
-
-func (a *Admitter) readFreshSignal(endpoint fwksched.Endpoint, key string, now time.Time) (attrmetrics.ScalarMetricValue, bool) {
-	value, ok := attrmetrics.ReadScalarMetricValue(endpoint, key)
-	if !ok {
-		return 0, false
-	}
-	updatedAt, ok := attrmetrics.ReadScalarMetricUpdateTime(endpoint, key)
-	if !ok || updatedAt.IsZero() || now.Sub(updatedAt) > a.metricsStalenessThreshold {
-		return 0, false
-	}
-	return value, true
+func (a *Admitter) readFreshSample(endpoint fwksched.Endpoint, key string, now time.Time) (float64, bool) {
+	sample, ok := attrmetrics.ReadMetricSample(endpoint, key)
+	return sample.Value, ok && finite(sample.Value) && sample.Value >= 0 && !sample.UpdatedAt.IsZero() &&
+		!sample.UpdatedAt.After(now) && now.Sub(sample.UpdatedAt) <= a.metricsStalenessThreshold
 }
 
 func endpointRoles(endpoint fwksched.Endpoint) (bool, bool) {
